@@ -1,0 +1,66 @@
+name: Build & Test
+
+on:
+  push:
+    paths:
+      - "blender_scraper/src/**"
+      - "blender_scraper/CMakeLists.txt"
+      - ".github/workflows/build-test.yml"
+  pull_request:
+    paths:
+      - "blender_scraper/src/**"
+      - "blender_scraper/CMakeLists.txt"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install cmake ninja --no-progress -y
+          vcpkg install curl:x64-windows nlohmann-json:x64-windows
+        shell: pwsh
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S blender_scraper -B build \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S blender_scraper -B build `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test — help flag
+        run: |
+          ./build/blender_scraper --help
+        shell: bash
+        if: runner.os == 'Linux'
+
+      - name: Smoke test — help flag (Windows)
+        run: build\Release\blender_scraper.exe --help
+        if: runner.os == 'Windows'

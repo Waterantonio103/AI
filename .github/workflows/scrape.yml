@@ -1,0 +1,196 @@
+name: Blender JSON Scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_repos:
+        description: "Max repos per query group"
+        default: "500"
+        required: false
+      min_score:
+        description: "filter_dataset.py min-score threshold"
+        default: "2"
+        required: false
+
+  schedule:
+    # Every Sunday at 02:00 UTC
+    - cron: "0 2 * * 0"
+
+env:
+  BUILD_DIR: blender_scraper/build
+
+# ---------------------------------------------------------------------------
+# Job 1 — Build the scraper binary and cache it for all scrape jobs
+# ---------------------------------------------------------------------------
+jobs:
+  build:
+    name: Build scraper
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        id: cmake-cache
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: cmake-${{ runner.os }}-${{ hashFiles('blender_scraper/CMakeLists.txt', 'blender_scraper/src/**') }}
+
+      - name: Configure & build
+        if: steps.cmake-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S blender_scraper -B $BUILD_DIR \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build $BUILD_DIR --parallel
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-bin
+          path: |
+            ${{ env.BUILD_DIR }}/blender_scraper
+            ${{ env.BUILD_DIR }}/build_dataset
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Parallel scrape: 4 matrix jobs, each covering a query group
+  #
+  # Each job writes to output-<group>/ and uploads it as an artifact.
+  # They all share the same GITHUB_TOKEN bucket (5 000 req/hr for PATs).
+  # Add GITHUB_TOKEN_2 … GITHUB_TOKEN_4 secrets to assign a dedicated token
+  # per job and quadruple effective throughput.
+  # ---------------------------------------------------------------------------
+  scrape:
+    name: Scrape (${{ matrix.group }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: topics
+            token_secret: SCRAPER_GITHUB_TOKEN_1
+          - group: keywords-early
+            token_secret: SCRAPER_GITHUB_TOKEN_2
+          - group: keywords-mid
+            token_secret: SCRAPER_GITHUB_TOKEN_3
+          - group: keywords-late
+            token_secret: SCRAPER_GITHUB_TOKEN_4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcurl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+
+      - name: Download scraper binary
+        uses: actions/download-artifact@v4
+        with:
+          name: scraper-bin
+          path: ${{ env.BUILD_DIR }}
+
+      - name: Make binary executable
+        run: chmod +x ${{ env.BUILD_DIR }}/blender_scraper
+
+      # Restore previously downloaded files so Phase 3 can skip already-saved ones
+      - name: Restore output cache
+        uses: actions/cache@v4
+        with:
+          path: output-${{ matrix.group }}
+          key: output-${{ matrix.group }}-${{ github.run_number }}
+          restore-keys: |
+            output-${{ matrix.group }}-
+
+      - name: Run scraper
+        env:
+          # Falls back to the repo's built-in GITHUB_TOKEN if the dedicated
+          # secret is not set — useful for single-token setups.
+          GH_TOKEN: ${{ secrets[matrix.token_secret] || secrets.GITHUB_TOKEN }}
+        run: |
+          ${{ env.BUILD_DIR }}/blender_scraper \
+            --github-token "$GH_TOKEN" \
+            --output        output-${{ matrix.group }} \
+            --max-repos     ${{ github.event.inputs.max_repos || '500' }} \
+            --query-group   ${{ matrix.group }} \
+            --threads       8 \
+            --rps           4
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-${{ matrix.group }}
+          path: output-${{ matrix.group }}
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — Merge all four outputs, deduplicate, and filter
+  # ---------------------------------------------------------------------------
+  merge:
+    name: Merge & filter dataset
+    needs: scrape
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all scrape outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: output-*
+          path: artifacts
+
+      # Combine all training_dataset.jsonl shards into one
+      - name: Merge JSONL shards
+        run: |
+          mkdir -p merged
+          for f in artifacts/output-*/training_dataset.jsonl; do
+            [ -f "$f" ] && cat "$f" >> merged/training_dataset.jsonl
+          done
+          echo "Total raw records: $(wc -l < merged/training_dataset.jsonl)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Filter & deduplicate dataset
+        run: |
+          python blender_scraper/filter_dataset.py \
+            merged/training_dataset.jsonl \
+            merged/blender_nodes_dataset.jsonl \
+            --min-score ${{ github.event.inputs.min_score || '2' }} \
+            --verbose
+          echo "Filtered records: $(wc -l < merged/blender_nodes_dataset.jsonl)"
+
+      - name: Upload final dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-nodes-dataset
+          path: |
+            merged/training_dataset.jsonl
+            merged/blender_nodes_dataset.jsonl
+          retention-days: 30
+
+      # Optional: commit the curated dataset to a dedicated data branch
+      - name: Commit dataset to data branch
+        if: github.ref == 'refs/heads/main' && github.event_name == 'schedule'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin data || git checkout --orphan data
+          git checkout data 2>/dev/null || git checkout -b data
+          cp merged/blender_nodes_dataset.jsonl blender_nodes_dataset.jsonl
+          git add blender_nodes_dataset.jsonl
+          git diff --cached --quiet || \
+            git commit -m "chore: update dataset $(date -u +%Y-%m-%d)"
+          git push origin data
