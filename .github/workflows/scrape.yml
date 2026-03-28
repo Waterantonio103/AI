@@ -175,11 +175,21 @@ jobs:
       - name: Upload final dataset
         uses: actions/upload-artifact@v4
         with:
-          name: blender-nodes-dataset
+          name: blender-nodes-dataset-${{ github.run_number }}
           path: |
             merged/training_dataset.jsonl
             merged/blender_nodes_dataset.jsonl
           retention-days: 30
+
+      - name: Trigger next run
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          gh workflow run scrape.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            --field max_repos="${{ github.event.inputs.max_repos || '500' }}" \
+            --field min_score="${{ github.event.inputs.min_score || '2' }}"
 
       # Optional: commit the curated dataset to a dedicated data branch
       - name: Commit dataset to data branch
