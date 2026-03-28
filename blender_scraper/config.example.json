@@ -1,0 +1,11 @@
+{
+  "github_token":  "ghp_YOUR_GITHUB_TOKEN_HERE",
+  "apify_token":   "",
+  "output_dir":    "output",
+  "max_repos":     500,
+  "threads":       8,
+  "rps":           5,
+  "use_apify":     false,
+  "validate_json": true,
+  "min_json_size": 10
+}
