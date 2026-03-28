@@ -187,6 +187,7 @@ jobs:
 
       - name: Trigger next run
         if: github.event.inputs.loop == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
