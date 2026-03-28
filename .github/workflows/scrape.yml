@@ -138,11 +138,15 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 3 — Merge all four outputs, deduplicate, and filter
+  # Exit code 1 from filter_dataset.py means API tokens were exhausted;
+  # the job will sleep until the GitHub rate-limit window resets (≤1 h)
+  # and retry up to 3 times before giving up.
   # ---------------------------------------------------------------------------
   merge:
     name: Merge & filter dataset
     needs: scrape
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # 3 retries × 60 min wait + runtime headroom
 
     steps:
       - uses: actions/checkout@v4
@@ -169,11 +173,30 @@ jobs:
 
       - name: Filter & deduplicate dataset
         run: |
-          python blender_scraper/filter_dataset.py \
-            merged/training_dataset.jsonl \
-            merged/blender_nodes_dataset.jsonl \
-            --min-score ${{ github.event.inputs.min_score || '2' }} \
-            --verbose
+          MAX_RETRIES=3
+          RETRY_WAIT=3600   # seconds — GitHub rate-limit window is ≤1 hour
+
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            python blender_scraper/filter_dataset.py \
+              merged/training_dataset.jsonl \
+              merged/blender_nodes_dataset.jsonl \
+              --min-score ${{ github.event.inputs.min_score || '2' }} \
+              --verbose
+            EXIT_CODE=$?
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              break
+            elif [ $EXIT_CODE -eq 1 ] && [ $attempt -lt $MAX_RETRIES ]; then
+              NEXT=$((attempt + 1))
+              echo "::warning::filter_dataset.py exited 1 (API tokens exhausted)." \
+                   "Sleeping ${RETRY_WAIT}s then retrying (attempt ${NEXT}/${MAX_RETRIES})…"
+              sleep $RETRY_WAIT
+            else
+              echo "::error::filter_dataset.py failed (exit $EXIT_CODE) after ${attempt}/${MAX_RETRIES} attempts."
+              exit $EXIT_CODE
+            fi
+          done
+
           echo "Filtered records: $(wc -l < merged/blender_nodes_dataset.jsonl)"
 
       - name: Upload final dataset
