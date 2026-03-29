@@ -11,9 +11,9 @@ on:
         description: "filter_dataset.py min-score threshold"
         default: "2"
         required: false
-      loop:
-        description: "Re-trigger this workflow after completion (set to 'true' for continuous scraping)"
-        default: "false"
+      runs:
+        description: "Number of scrape rounds (1–10). Each round runs all 4 query groups."
+        default: "1"
         required: false
 
   schedule:
@@ -65,29 +65,50 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Job 2 — Parallel scrape: 4 matrix jobs, each covering a query group
+  # Job 2 — Generate the scrape matrix dynamically from the `runs` input.
+  # Produces exactly (runs × 4) jobs instead of a fixed 10×4 grid.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Generate matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Build matrix JSON
+        id: gen
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          runs  = int(os.environ.get("RUNS", "1"))
+          groups = [
+            {"name": "topics",         "token_secret": "SCRAPER_GITHUB_TOKEN_1"},
+            {"name": "keywords-early", "token_secret": "SCRAPER_GITHUB_TOKEN_2"},
+            {"name": "keywords-mid",   "token_secret": "SCRAPER_GITHUB_TOKEN_3"},
+            {"name": "keywords-late",  "token_secret": "SCRAPER_GITHUB_TOKEN_4"},
+          ]
+          include = [{"run": r, "group": g} for r in range(1, runs + 1) for g in groups]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("matrix=" + json.dumps({"include": include}) + "\n")
+          PYEOF
+        env:
+          RUNS: ${{ github.event.inputs.runs || '1' }}
+        shell: bash
+      - run: echo "${{ steps.gen.outputs.matrix }}" | python3 -m json.tool  # sanity-check
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — Parallel scrape: (runs × 4 query groups) jobs, all generated above.
   #
-  # Each job writes to output-<group>/ and uploads it as an artifact.
-  # They all share the same GITHUB_TOKEN bucket (5 000 req/hr for PATs).
-  # Add GITHUB_TOKEN_2 … GITHUB_TOKEN_4 secrets to assign a dedicated token
-  # per job and quadruple effective throughput.
+  # Token assignment: one PAT per query group for maximum throughput.
+  # Add SCRAPER_GITHUB_TOKEN_2…4 secrets to avoid sharing the rate-limit
+  # bucket across groups. Falls back to GITHUB_TOKEN if a secret is unset.
   # ---------------------------------------------------------------------------
   scrape:
-    name: Scrape (${{ matrix.group }})
-    needs: build
+    name: "Scrape (${{ matrix.group.name }}, round ${{ matrix.run }})"
+    needs: [build, setup]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - group: topics
-            token_secret: SCRAPER_GITHUB_TOKEN_1
-          - group: keywords-early
-            token_secret: SCRAPER_GITHUB_TOKEN_2
-          - group: keywords-mid
-            token_secret: SCRAPER_GITHUB_TOKEN_3
-          - group: keywords-late
-            token_secret: SCRAPER_GITHUB_TOKEN_4
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -110,43 +131,43 @@ jobs:
       - name: Restore output cache
         uses: actions/cache@v4
         with:
-          path: output-${{ matrix.group }}
-          key: output-${{ matrix.group }}-${{ github.run_number }}
+          path: output-${{ matrix.group.name }}-run${{ matrix.run }}
+          key: output-${{ matrix.group.name }}-run${{ matrix.run }}-${{ github.run_number }}
           restore-keys: |
-            output-${{ matrix.group }}-
+            output-${{ matrix.group.name }}-run${{ matrix.run }}-
 
       - name: Run scraper
         env:
-          # Falls back to the repo's built-in GITHUB_TOKEN if the dedicated
-          # secret is not set — useful for single-token setups.
-          GH_TOKEN: ${{ secrets[matrix.token_secret] || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets[matrix.group.token_secret] || secrets.GITHUB_TOKEN }}
         run: |
           ${{ env.BUILD_DIR }}/blender_scraper \
             --github-token "$GH_TOKEN" \
-            --output        output-${{ matrix.group }} \
+            --output        output-${{ matrix.group.name }}-run${{ matrix.run }} \
             --max-repos     ${{ github.event.inputs.max_repos || '500' }} \
-            --query-group   ${{ matrix.group }} \
+            --query-group   ${{ matrix.group.name }} \
             --threads       8 \
             --rps           4
 
       - name: Upload output
         uses: actions/upload-artifact@v4
         with:
-          name: output-${{ matrix.group }}
-          path: output-${{ matrix.group }}
+          name: output-${{ matrix.group.name }}-run${{ matrix.run }}
+          path: output-${{ matrix.group.name }}-run${{ matrix.run }}
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Job 3 — Merge all four outputs, deduplicate, and filter
-  # Exit code 1 from filter_dataset.py means API tokens were exhausted;
-  # the job will sleep until the GitHub rate-limit window resets (≤1 h)
-  # and retry up to 3 times before giving up.
+  # Job 4 — Merge all outputs, produce one zip per round + one combined zip
+  #
+  # Artifact layout inside blender-nodes-dataset-<run_number>/:
+  #   dataset-run1.zip   — raw + filtered JSONL for round 1 (all 4 groups)
+  #   dataset-run2.zip   — round 2, etc.
+  #   dataset-combined.zip — merged + filtered across all rounds
   # ---------------------------------------------------------------------------
   merge:
-    name: Merge & filter dataset
-    needs: scrape
+    name: Merge & package datasets
+    needs: [setup, scrape]
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 3 retries × 60 min wait + runtime headroom
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -157,94 +178,127 @@ jobs:
           pattern: output-*
           path: artifacts
 
-      # Combine all training_dataset.jsonl shards into one
-      - name: Merge JSONL shards
-        run: |
-          mkdir -p merged
-          for f in artifacts/output-*/training_dataset.jsonl; do
-            [ -f "$f" ] && cat "$f" >> merged/training_dataset.jsonl
-          done
-          echo "Total raw records: $(wc -l < merged/training_dataset.jsonl)"
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Filter & deduplicate dataset
+      # Build per-round merged JSONL files, then zip each round.
+      - name: Merge shards per round
         run: |
-          MAX_RETRIES=3
-          RETRY_WAIT=3600   # seconds — GitHub rate-limit window is ≤1 hour
+          RUNS=${{ github.event.inputs.runs || '1' }}
+          mkdir -p zips
 
-          for attempt in $(seq 1 $MAX_RETRIES); do
-            python blender_scraper/filter_dataset.py \
-              merged/training_dataset.jsonl \
-              merged/blender_nodes_dataset.jsonl \
-              --min-score ${{ github.event.inputs.min_score || '2' }} \
-              --verbose
-            EXIT_CODE=$?
+          for run in $(seq 1 $RUNS); do
+            mkdir -p "round-${run}"
+            for f in artifacts/output-*-run${run}/training_dataset.jsonl; do
+              [ -f "$f" ] && cat "$f" >> "round-${run}/training_dataset.jsonl"
+            done
 
-            if [ $EXIT_CODE -eq 0 ]; then
-              break
-            elif [ $EXIT_CODE -eq 1 ] && [ $attempt -lt $MAX_RETRIES ]; then
-              NEXT=$((attempt + 1))
-              echo "::warning::filter_dataset.py exited 1 (API tokens exhausted)." \
-                   "Sleeping ${RETRY_WAIT}s then retrying (attempt ${NEXT}/${MAX_RETRIES})…"
-              sleep $RETRY_WAIT
+            if [ -f "round-${run}/training_dataset.jsonl" ]; then
+              echo "Round ${run} raw records: $(wc -l < round-${run}/training_dataset.jsonl)"
             else
-              echo "::error::filter_dataset.py failed (exit $EXIT_CODE) after ${attempt}/${MAX_RETRIES} attempts."
-              exit $EXIT_CODE
+              echo "::warning::Round ${run} produced no output."
             fi
           done
 
-          echo "Filtered records: $(wc -l < merged/blender_nodes_dataset.jsonl)"
+      - name: Filter & deduplicate per round
+        run: |
+          RUNS=${{ github.event.inputs.runs || '1' }}
+          MIN_SCORE=${{ github.event.inputs.min_score || '2' }}
 
-      - name: Upload final dataset
+          for run in $(seq 1 $RUNS); do
+            RAW="round-${run}/training_dataset.jsonl"
+            [ -f "$RAW" ] || continue
+
+            MAX_RETRIES=3
+            RETRY_WAIT=3600
+
+            for attempt in $(seq 1 $MAX_RETRIES); do
+              python blender_scraper/filter_dataset.py \
+                "$RAW" \
+                "round-${run}/blender_nodes_dataset.jsonl" \
+                --min-score "$MIN_SCORE" \
+                --verbose
+              EXIT_CODE=$?
+
+              if [ $EXIT_CODE -eq 0 ]; then
+                echo "Round ${run} filtered records: $(wc -l < round-${run}/blender_nodes_dataset.jsonl)"
+                break
+              elif [ $EXIT_CODE -eq 1 ] && [ $attempt -lt $MAX_RETRIES ]; then
+                echo "::warning::Round ${run} filter attempt ${attempt}/${MAX_RETRIES} failed (API tokens exhausted). Retrying in ${RETRY_WAIT}s…"
+                sleep $RETRY_WAIT
+              else
+                echo "::error::Round ${run} filter failed (exit $EXIT_CODE) after ${attempt}/${MAX_RETRIES} attempts."
+                exit $EXIT_CODE
+              fi
+            done
+          done
+
+      - name: Build combined dataset across all rounds
+        run: |
+          RUNS=${{ github.event.inputs.runs || '1' }}
+          MIN_SCORE=${{ github.event.inputs.min_score || '2' }}
+          mkdir -p combined
+
+          for run in $(seq 1 $RUNS); do
+            [ -f "round-${run}/training_dataset.jsonl" ] && \
+              cat "round-${run}/training_dataset.jsonl" >> combined/training_dataset.jsonl
+          done
+
+          if [ -f combined/training_dataset.jsonl ]; then
+            echo "Combined raw records: $(wc -l < combined/training_dataset.jsonl)"
+
+            MAX_RETRIES=3
+            RETRY_WAIT=3600
+            for attempt in $(seq 1 $MAX_RETRIES); do
+              python blender_scraper/filter_dataset.py \
+                combined/training_dataset.jsonl \
+                combined/blender_nodes_dataset.jsonl \
+                --min-score "$MIN_SCORE" \
+                --verbose
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -eq 0 ]; then
+                echo "Combined filtered records: $(wc -l < combined/blender_nodes_dataset.jsonl)"
+                break
+              elif [ $EXIT_CODE -eq 1 ] && [ $attempt -lt $MAX_RETRIES ]; then
+                echo "::warning::Combined filter attempt ${attempt}/${MAX_RETRIES} failed. Retrying in ${RETRY_WAIT}s…"
+                sleep $RETRY_WAIT
+              else
+                echo "::error::Combined filter failed (exit $EXIT_CODE) after ${attempt}/${MAX_RETRIES} attempts."
+                exit $EXIT_CODE
+              fi
+            done
+          fi
+
+      - name: Package into zips
+        run: |
+          RUNS=${{ github.event.inputs.runs || '1' }}
+
+          for run in $(seq 1 $RUNS); do
+            DIR="round-${run}"
+            [ -d "$DIR" ] || continue
+            # At least one jsonl must exist to be worth zipping
+            if ls "$DIR"/*.jsonl 1>/dev/null 2>&1; then
+              zip -j "zips/dataset-run${run}.zip" "$DIR"/*.jsonl
+              echo "Created zips/dataset-run${run}.zip"
+            fi
+          done
+
+          if ls combined/*.jsonl 1>/dev/null 2>&1; then
+            zip -j zips/dataset-combined.zip combined/*.jsonl
+            echo "Created zips/dataset-combined.zip"
+          fi
+
+          echo "--- zip inventory ---"
+          ls -lh zips/
+
+      - name: Upload dataset zips
         uses: actions/upload-artifact@v4
         with:
           name: blender-nodes-dataset-${{ github.run_number }}
-          path: |
-            merged/training_dataset.jsonl
-            merged/blender_nodes_dataset.jsonl
+          path: zips/
           retention-days: 30
-
-      - name: Trigger next run
-        if: ${{ always() && github.event.inputs.loop == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          python3 - <<'PYEOF'
-          import json, os, sys, urllib.request, urllib.error
-
-          token = os.environ.get("GH_TOKEN", "")
-          if not token:
-              print("::error::PAT_TOKEN is not set. Add a classic PAT with 'workflow' scope, or a fine-grained PAT with 'Actions: Write'.")
-              sys.exit(1)
-
-          payload = json.dumps({
-              "ref": "${{ github.ref_name }}",
-              "inputs": {
-                  "max_repos": "${{ github.event.inputs.max_repos || '500' }}",
-                  "min_score": "${{ github.event.inputs.min_score || '2' }}",
-                  "loop":      "true"
-              }
-          }).encode()
-
-          url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/scrape.yml/dispatches"
-          req = urllib.request.Request(url, data=payload, method="POST", headers={
-              "Authorization":        f"Bearer {token}",
-              "Accept":               "application/vnd.github+json",
-              "Content-Type":         "application/json",
-              "X-GitHub-Api-Version": "2022-11-28",
-          })
-          try:
-              with urllib.request.urlopen(req) as r:
-                  print(f"Next run triggered successfully (HTTP {r.status}).")
-          except urllib.error.HTTPError as e:
-              body = e.read().decode()
-              print(f"::error::GitHub API returned HTTP {e.code}: {body}", file=sys.stderr)
-              sys.exit(1)
-          PYEOF
 
       # Optional: commit the curated dataset to a dedicated data branch
       - name: Commit dataset to data branch
@@ -254,7 +308,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin data || git checkout --orphan data
           git checkout data 2>/dev/null || git checkout -b data
-          cp merged/blender_nodes_dataset.jsonl blender_nodes_dataset.jsonl
+          cp combined/blender_nodes_dataset.jsonl blender_nodes_dataset.jsonl
           git add blender_nodes_dataset.jsonl
           git diff --cached --quiet || \
             git commit -m "chore: update dataset $(date -u +%Y-%m-%d)"
