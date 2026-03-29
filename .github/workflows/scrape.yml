@@ -93,7 +93,6 @@ jobs:
         env:
           RUNS: ${{ github.event.inputs.runs || '1' }}
         shell: bash
-      - run: echo "${{ steps.gen.outputs.matrix }}" | python3 -m json.tool  # sanity-check
 
   # ---------------------------------------------------------------------------
   # Job 3 — Parallel scrape: (runs × 4 query groups) jobs, all generated above.
