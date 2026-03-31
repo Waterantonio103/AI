@@ -1,5 +1,6 @@
 ﻿blender_scraper/config.json
 blender_scraper/build/
 blender_scraper/output/
+mcp-secure-server/
 .claude/
 *.html

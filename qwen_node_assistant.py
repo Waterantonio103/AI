@@ -35,8 +35,10 @@ from collections import OrderedDict
 
 # === GLOBAL STATE ===
 
+
 class _State:
     """Mutable singleton for cross-thread communication."""
+
     # Display
     response_lines: list[str] = []
     raw_response: str = ""
@@ -48,31 +50,33 @@ class _State:
     # --- Constrained generation phases ---
     # Phase flow: idle → nodes → building → linking → done
     gen_phase: str = "idle"
-    pending_phase1: dict | None = None   # nodes spec from step 1
-    pending_phase2: dict | None = None   # links spec from step 2
+    pending_phase1: dict | None = None  # nodes spec from step 1
+    pending_phase2: dict | None = None  # links spec from step 2
     # Context passed between phases
     gen_user_prompt: str = ""
     gen_base_url: str = ""
     gen_model: str = ""
-    gen_tree_type: str = ""              # "ShaderNodeTree" or "GeometryNodeTree"
-    gen_node_ids: list[str] = []         # IDs of nodes built in phase 1
-    gen_socket_info: str = ""            # formatted socket info for phase 2 prompt
-    gen_clear: bool = True               # whether to clear tree before building
-    abort_requested: bool = False        # set True by Abort operator to stop bg thread
+    gen_tree_type: str = ""  # "ShaderNodeTree" or "GeometryNodeTree"
+    gen_node_ids: list[str] = []  # IDs of nodes built in phase 1
+    gen_socket_info: str = ""  # formatted socket info for phase 2 prompt
+    gen_clear: bool = True  # whether to clear tree before building
+    abort_requested: bool = False  # set True by Abort operator to stop bg thread
 
     # --- Revert / undo snapshot ---
     pre_gen_snapshot: dict | None = None  # serialized tree state before last generation
 
     # --- Panel visibility / VRAM unload tracking ---
-    panel_last_drawn: float = 0.0        # time.time() stamp updated every panel draw
-    model_is_loaded: bool = False        # True after any Ollama request is dispatched
-    loaded_model: str = ""               # last model sent to Ollama
-    loaded_base_url: str = ""            # base URL used for that model
+    panel_last_drawn: float = 0.0  # time.time() stamp updated every panel draw
+    model_is_loaded: bool = False  # True after any Ollama request is dispatched
+    loaded_model: str = ""  # last model sent to Ollama
+    loaded_base_url: str = ""  # base URL used for that model
+
 
 _state = _State()
 
 
 # === ADDON PREFERENCES ===
+
 
 class QNA_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__ or __name__
@@ -98,7 +102,9 @@ class QNA_AddonPreferences(bpy.types.AddonPreferences):
     response_wrap_width: bpy.props.IntProperty(
         name="Wrap Width (chars)",
         description="Character width for response text wrapping",
-        default=62, min=30, max=160,
+        default=62,
+        min=30,
+        max=160,
     )  # type: ignore
 
     gen_clear_existing: bpy.props.BoolProperty(
@@ -135,72 +141,105 @@ def _pref(attr: str, fallback):
 # Profile list — ordered by overall quality (used to rank auto-selection).
 # gen/ana: lower = more preferred for that role; 0 = do not recommend.
 _MODEL_PROFILES = [
-    {"pat": "blender-nodes",
-     "label": "Blender Nodes (custom)",
-     "desc": "Your locally fine-tuned Qwen2.5-3B-Instruct — trained specifically on Blender node graphs.",
-     "pros": "Fine-tuned on Blender node data · tiny VRAM (~2 GB) · fast",
-     "cons": "3B base — may need more correction passes than larger models",
-     "gen": 2, "ana": 4},
-    {"pat": "qwen3",
-     "label": "Qwen3",
-     "desc": "Alibaba's latest generation. Best reasoning + JSON compliance in the Qwen family.",
-     "pros": "Strong reasoning · reliable JSON · good material/shading knowledge",
-     "cons": "Slightly slower than Qwen 2.5 at the same parameter count",
-     "gen": 1, "ana": 1},
-    {"pat": "mistral-small3.1",
-     "label": "Mistral Small 3.1",
-     "desc": "24B — most capable model that fits in 16 GB VRAM. Rich material/shading domain knowledge.",
-     "pros": "Best understanding of vague descriptions · strong creative output",
-     "cons": "~15 GB VRAM — leaves little headroom; noticeably slower",
-     "gen": 2, "ana": 2},
-    {"pat": "phi4",
-     "label": "Phi-4",
-     "desc": "Microsoft Research 14B. Exceptional schema adherence and very low hallucination rate.",
-     "pros": "Precise structured output · low hallucination · fast",
-     "cons": "Weaker on open-ended material descriptions and shading concepts",
-     "gen": 3, "ana": 5},
-    {"pat": "qwen2.5-coder",
-     "label": "Qwen2.5-Coder",
-     "desc": "Code-tuned 14B. Most reliable JSON output but limited shading domain knowledge.",
-     "pros": "Consistent valid JSON · fast · low memory (~9 GB)",
-     "cons": "Trained on code not materials — misses nuanced descriptions",
-     "gen": 4, "ana": 6},
-    {"pat": "gemma3",
-     "label": "Gemma 3",
-     "desc": "Google 12B. Outstanding at explaining and reasoning about structured data.",
-     "pros": "Excellent analysis · strong instruction-following · good explanations",
-     "cons": "Average JSON output quality — better for analysis than generation",
-     "gen": 5, "ana": 4},
-    {"pat": "deepseek-r1",
-     "label": "DeepSeek-R1",
-     "desc": "Shows chain-of-thought reasoning. Best for understanding why a node setup works.",
-     "pros": "Transparent reasoning · great for debugging node graphs",
-     "cons": "3–5× slower due to thinking tokens · overkill for generation",
-     "gen": 6, "ana": 3},
-    {"pat": "qwen2.5",
-     "label": "Qwen2.5",
-     "desc": "General-purpose Qwen 2.5. Better domain knowledge than coder variant for analysis.",
-     "pros": "Good speed/quality balance · wide knowledge base",
-     "cons": "Outclassed by Qwen3 at same size · less consistent JSON than coder",
-     "gen": 7, "ana": 7},
-    {"pat": "llama3",
-     "label": "LLaMA 3",
-     "desc": "Meta's general model. Decent analysis but unreliable structured JSON output.",
-     "pros": "Good general knowledge · widely supported",
-     "cons": "Inconsistent JSON formatting — not ideal for node generation",
-     "gen": 8, "ana": 9},
-    {"pat": "qwen2.5vl",
-     "label": "Qwen2.5-VL",
-     "desc": "Vision-language model. Vision capability is unused in this addon (text-only).",
-     "pros": "Fast · small footprint (~5 GB)",
-     "cons": "Vision wasted here · 7B reasoning depth limits analysis quality",
-     "gen": 9, "ana": 8},
-    {"pat": "mistral",
-     "label": "Mistral",
-     "desc": "Older 7B base. Fast but limited for complex node setups.",
-     "pros": "Very fast · low VRAM",
-     "cons": "Limited instruction-following for structured/schema tasks",
-     "gen": 10, "ana": 10},
+    {
+        "pat": "blender-nodes",
+        "label": "Blender Nodes (custom)",
+        "desc": "Your locally fine-tuned Qwen2.5-3B-Instruct — trained specifically on Blender node graphs.",
+        "pros": "Fine-tuned on Blender node data · tiny VRAM (~2 GB) · fast",
+        "cons": "3B base — may need more correction passes than larger models",
+        "gen": 2,
+        "ana": 4,
+    },
+    {
+        "pat": "qwen3",
+        "label": "Qwen3",
+        "desc": "Alibaba's latest generation. Best reasoning + JSON compliance in the Qwen family.",
+        "pros": "Strong reasoning · reliable JSON · good material/shading knowledge",
+        "cons": "Slightly slower than Qwen 2.5 at the same parameter count",
+        "gen": 1,
+        "ana": 1,
+    },
+    {
+        "pat": "mistral-small3.1",
+        "label": "Mistral Small 3.1",
+        "desc": "24B — most capable model that fits in 16 GB VRAM. Rich material/shading domain knowledge.",
+        "pros": "Best understanding of vague descriptions · strong creative output",
+        "cons": "~15 GB VRAM — leaves little headroom; noticeably slower",
+        "gen": 2,
+        "ana": 2,
+    },
+    {
+        "pat": "phi4",
+        "label": "Phi-4",
+        "desc": "Microsoft Research 14B. Exceptional schema adherence and very low hallucination rate.",
+        "pros": "Precise structured output · low hallucination · fast",
+        "cons": "Weaker on open-ended material descriptions and shading concepts",
+        "gen": 3,
+        "ana": 5,
+    },
+    {
+        "pat": "qwen2.5-coder",
+        "label": "Qwen2.5-Coder",
+        "desc": "Code-tuned 14B. Most reliable JSON output but limited shading domain knowledge.",
+        "pros": "Consistent valid JSON · fast · low memory (~9 GB)",
+        "cons": "Trained on code not materials — misses nuanced descriptions",
+        "gen": 4,
+        "ana": 6,
+    },
+    {
+        "pat": "gemma3",
+        "label": "Gemma 3",
+        "desc": "Google 12B. Outstanding at explaining and reasoning about structured data.",
+        "pros": "Excellent analysis · strong instruction-following · good explanations",
+        "cons": "Average JSON output quality — better for analysis than generation",
+        "gen": 5,
+        "ana": 4,
+    },
+    {
+        "pat": "deepseek-r1",
+        "label": "DeepSeek-R1",
+        "desc": "Shows chain-of-thought reasoning. Best for understanding why a node setup works.",
+        "pros": "Transparent reasoning · great for debugging node graphs",
+        "cons": "3–5× slower due to thinking tokens · overkill for generation",
+        "gen": 6,
+        "ana": 3,
+    },
+    {
+        "pat": "qwen2.5",
+        "label": "Qwen2.5",
+        "desc": "General-purpose Qwen 2.5. Better domain knowledge than coder variant for analysis.",
+        "pros": "Good speed/quality balance · wide knowledge base",
+        "cons": "Outclassed by Qwen3 at same size · less consistent JSON than coder",
+        "gen": 7,
+        "ana": 7,
+    },
+    {
+        "pat": "llama3",
+        "label": "LLaMA 3",
+        "desc": "Meta's general model. Decent analysis but unreliable structured JSON output.",
+        "pros": "Good general knowledge · widely supported",
+        "cons": "Inconsistent JSON formatting — not ideal for node generation",
+        "gen": 8,
+        "ana": 9,
+    },
+    {
+        "pat": "qwen2.5vl",
+        "label": "Qwen2.5-VL",
+        "desc": "Vision-language model. Vision capability is unused in this addon (text-only).",
+        "pros": "Fast · small footprint (~5 GB)",
+        "cons": "Vision wasted here · 7B reasoning depth limits analysis quality",
+        "gen": 9,
+        "ana": 8,
+    },
+    {
+        "pat": "mistral",
+        "label": "Mistral",
+        "desc": "Older 7B base. Fast but limited for complex node setups.",
+        "pros": "Very fast · low VRAM",
+        "cons": "Limited instruction-following for structured/schema tasks",
+        "gen": 10,
+        "ana": 10,
+    },
 ]
 
 # Keywords that identify non-generative (embedding) models — filter these out.
@@ -210,12 +249,18 @@ _EMBED_KEYWORDS = ("embed", "nomic", "all-minilm", "bge-", "e5-", "rerank")
 # Generate list: sorted by gen rank, excludes models unsuitable for generation.
 # Analyze list:  sorted by ana rank, excludes models unsuitable for analysis.
 _model_items_generate: list[tuple[str, str, str]] = [
-    ("qwen2.5-coder:14b", "qwen2.5-coder:14b",
-     "Code-tuned 14B · consistent JSON output · fast (~9 GB VRAM)"),
+    (
+        "qwen2.5-coder:14b",
+        "qwen2.5-coder:14b",
+        "Code-tuned 14B · consistent JSON output · fast (~9 GB VRAM)",
+    ),
 ]
 _model_items_analyze: list[tuple[str, str, str]] = [
-    ("qwen2.5vl:7b", "qwen2.5vl:7b",
-     "Vision-language 7B · fast but limited reasoning depth"),
+    (
+        "qwen2.5vl:7b",
+        "qwen2.5vl:7b",
+        "Vision-language 7B · fast but limited reasoning depth",
+    ),
 ]
 
 # Models with rank above this threshold for a role are excluded from that role's list.
@@ -237,7 +282,9 @@ def _get_model_profile(name: str) -> dict | None:
     return None
 
 
-def _build_model_items_for_role(names: list[str], role: str) -> list[tuple[str, str, str]]:
+def _build_model_items_for_role(
+    names: list[str], role: str
+) -> list[tuple[str, str, str]]:
     """
     Build a role-specific EnumProperty items list from raw Ollama model names.
     - Filters embedding models.
@@ -287,7 +334,7 @@ def _rebuild_model_lists(all_names: list[str]) -> None:
     """Populate both role-specific item lists from a fresh set of model names."""
     global _model_items_generate, _model_items_analyze
     _model_items_generate = _build_model_items_for_role(all_names, "gen")
-    _model_items_analyze  = _build_model_items_for_role(all_names, "ana")
+    _model_items_analyze = _build_model_items_for_role(all_names, "ana")
 
 
 def _enum_generate_items(self, context):
@@ -300,7 +347,7 @@ def _enum_analyze_items(self, context):
 
 def _on_mode_change(self, context):
     """When mode switches, reset the model slot to the best for the new role."""
-    if self.qna_mode == 'GENERATE':
+    if self.qna_mode == "GENERATE":
         available = [item[0] for item in _model_items_generate if item[0] != "none"]
         best = _best_model_for(available, "gen")
         if best:
@@ -313,6 +360,7 @@ def _on_mode_change(self, context):
 
 
 # === NODE TREE SERIALIZER ===
+
 
 def _socket_default(socket) -> object:
     if not hasattr(socket, "default_value"):
@@ -330,10 +378,80 @@ def _socket_default(socket) -> object:
     return str(val)
 
 
-def serialize_node_tree(node_tree: bpy.types.NodeTree) -> dict:
+def _serialize_val(val):
+    """Serialize a Blender property value to JSON-safe types."""
+    if isinstance(val, bpy.types.ID):
+        return {"__datablock__": True, "id_type": type(val).__name__, "name": val.name}
+    elif (
+        "Vector" in str(type(val))
+        or "Color" in str(type(val))
+        or "Euler" in str(type(val))
+    ):
+        return list(val)
+    elif type(val) in (int, float, str, bool, type(None)):
+        return val
+    elif isinstance(val, set):
+        return list(val)
+    elif hasattr(val, "name") and type(val).__name__ != "type":
+        return str(val.name)
+    return None
+
+
+def _deserialize_val(val):
+    """Deserialize a JSON value back to a Blender property value."""
+    if isinstance(val, dict) and val.get("__datablock__"):
+        id_type = val.get("id_type")
+        name = val.get("name")
+        if id_type == "Material" and name in bpy.data.materials:
+            return bpy.data.materials[name]
+        elif id_type == "Object" and name in bpy.data.objects:
+            return bpy.data.objects[name]
+        elif id_type == "Image" and name in bpy.data.images:
+            return bpy.data.images[name]
+        elif id_type == "Collection" and name in bpy.data.collections:
+            return bpy.data.collections[name]
+        elif id_type == "Texture" and name in bpy.data.textures:
+            return bpy.data.textures[name]
+        elif "NodeTree" in (id_type or "") and name in bpy.data.node_groups:
+            return bpy.data.node_groups[name]
+        return None
+    return val
+
+
+def serialize_node_tree(
+    node_tree: bpy.types.NodeTree, _shared_groups: dict | None = None
+) -> dict:
+    """Recursively serialise *node_tree* and all sub-node-groups it references.
+
+    Follows the same structured import/export pattern as Up3date's CityJSON
+    parser/exporter: interface, nodes with full properties, links, and
+    embedded sub-groups are all captured with identifiers for reliable
+    round-trip reconstruction.
+
+    *_shared_groups* is a flat dict ``{group_name: data}`` shared across
+    recursive calls so each sub-group is only exported once.
+    """
+    is_root = _shared_groups is None
+    if is_root:
+        _shared_groups = {}
+
     data: dict = OrderedDict()
     data["tree_name"] = node_tree.name
     data["tree_type"] = node_tree.bl_idname
+
+    # Extract interface (Group Inputs/Outputs)
+    data["interface"] = []
+    if hasattr(node_tree, "interface"):
+        for item in getattr(node_tree.interface, "items_tree", []):
+            if getattr(item, "item_type", "SOCKET") == "SOCKET":
+                data["interface"].append(
+                    {
+                        "name": item.name,
+                        "in_out": item.in_out,
+                        "socket_type": item.socket_type,
+                        "identifier": getattr(item, "identifier", ""),
+                    }
+                )
 
     nodes_list = []
     for node in node_tree.nodes:
@@ -343,46 +461,152 @@ def serialize_node_tree(node_tree: bpy.types.NodeTree) -> dict:
         nd["name"] = node.name
         nd["label"] = node.label or ""
         nd["location"] = [round(node.location.x, 1), round(node.location.y, 1)]
+        nd["width"] = getattr(node, "width", 140.0)
         nd["muted"] = node.mute
+        nd["use_custom_color"] = getattr(node, "use_custom_color", False)
+        nd["color"] = list(node.color)
+
+        # Serialize node properties via bl_rna (same pattern as json_mover.py / Up3date)
+        props: dict = {}
+        skip_keys = {
+            "name",
+            "type",
+            "location",
+            "dimensions",
+            "width",
+            "height",
+            "inputs",
+            "outputs",
+            "bl_idname",
+            "bl_label",
+            "bl_description",
+            "bl_icon",
+            "bl_width_default",
+            "bl_width_min",
+            "bl_width_max",
+            "bl_height_default",
+            "bl_height_min",
+            "bl_height_max",
+            "location_absolute",
+            "warning_propagation",
+            "select",
+            "hide",
+            "mute",
+            "label",
+            "active_item",
+        }
+        if hasattr(node, "node_tree") and node.node_tree:
+            sub_ng = node.node_tree
+            s_val = _serialize_val(sub_ng)
+            if s_val is not None:
+                props["node_tree"] = s_val
+            # Recursively embed the sub-group
+            if sub_ng.name not in _shared_groups:
+                _shared_groups[sub_ng.name] = {}
+                sub_type = type(sub_ng).__name__
+                _shared_groups[sub_ng.name] = serialize_node_tree(
+                    sub_ng, _shared_groups
+                )
+
+        for key in node.bl_rna.properties.keys():
+            if key in skip_keys:
+                continue
+            prop = node.bl_rna.properties[key]
+            if not prop.is_readonly:
+                try:
+                    val = getattr(node, key)
+                    s_val = _serialize_val(val)
+                    if s_val is not None:
+                        props[key] = s_val
+                except Exception:
+                    pass
+        if props:
+            nd["properties"] = props
+
+        # Socket defaults with identifiers
         nd["inputs"] = []
-        for s in node.inputs:
+        for idx, s in enumerate(node.inputs):
             sd: dict = OrderedDict()
             sd["name"] = s.name
             sd["type"] = s.bl_idname
+            sd["identifier"] = getattr(s, "identifier", "")
             sd["default_value"] = _socket_default(s)
             nd["inputs"].append(sd)
+
         nd["outputs"] = []
-        for s in node.outputs:
+        for idx, s in enumerate(node.outputs):
             sd = OrderedDict()
             sd["name"] = s.name
             sd["type"] = s.bl_idname
+            sd["identifier"] = getattr(s, "identifier", "")
             sd["default_value"] = _socket_default(s)
             nd["outputs"].append(sd)
-        extras: dict = {}
-        for attr in ("blend_type", "operation", "data_type", "mode",
-                     "interpolation", "distribution"):
-            if hasattr(node, attr):
-                try:
-                    v = getattr(node, attr)
-                    if isinstance(v, str):
-                        extras[attr] = v
-                except Exception:
-                    pass
-        if extras:
-            nd["properties"] = extras
+
+        # Parent frame reference
+        if hasattr(node, "parent") and node.parent:
+            nd["parent"] = node.parent.name
+
+        # Dynamic node items (Capture Attribute, Store Named Attribute, Repeat Zones, Simulation Zones)
+        items_collections = [
+            "capture_items",
+            "store_items",
+            "repeat_items",
+            "simulation_items",
+        ]
+        node_items = {}
+        for col_name in items_collections:
+            if hasattr(node, col_name):
+                col = getattr(node, col_name)
+                extracted_col = []
+                for item in col:
+                    item_data = {}
+                    for k in item.bl_rna.properties.keys():
+                        if k not in ("rna_type", "name"):
+                            try:
+                                v = getattr(item, k)
+                                sv = _serialize_val(v)
+                                if sv is not None:
+                                    item_data[k] = sv
+                            except Exception:
+                                pass
+                    extracted_col.append(item_data)
+                if extracted_col:
+                    node_items[col_name] = extracted_col
+        if node_items:
+            nd["node_items"] = node_items
+
         nodes_list.append(nd)
     data["nodes"] = nodes_list
 
+    # Links with identifiers and indices
     links_list = []
     for link in node_tree.links:
+        try:
+            from_idx = list(link.from_node.outputs).index(link.from_socket)
+        except ValueError:
+            from_idx = None
+        try:
+            to_idx = list(link.to_node.inputs).index(link.to_socket)
+        except ValueError:
+            to_idx = None
         ld: dict = OrderedDict()
         ld["from_node"] = link.from_node.name
-        ld["from_socket"] = link.from_socket.name
+        ld["from_socket"] = getattr(
+            link.from_socket, "identifier", link.from_socket.name
+        )
+        ld["from_socket_name"] = link.from_socket.name
+        ld["from_socket_index"] = from_idx
         ld["to_node"] = link.to_node.name
-        ld["to_socket"] = link.to_socket.name
+        ld["to_socket"] = getattr(link.to_socket, "identifier", link.to_socket.name)
+        ld["to_socket_name"] = link.to_socket.name
+        ld["to_socket_index"] = to_idx
         ld["is_muted"] = link.is_muted
         links_list.append(ld)
     data["links"] = links_list
+
+    if is_root:
+        data["embedded_groups"] = _shared_groups
+
     return data
 
 
@@ -617,25 +841,98 @@ GeometryNodeMeshCylinder: outputs Mesh(Geometry). inputs: Vertices(Int), Radius(
 GeometryNodeMeshCone: outputs Mesh(Geometry). inputs: Vertices(Int), Radius Top(Float), Radius Bottom(Float), Depth(Float)
 GeometryNodeMeshCircle: outputs Mesh(Geometry). inputs: Vertices(Int), Radius(Float)
 GeometryNodeMeshLine: outputs Mesh(Geometry). inputs: Count(Int), Start Location(Vector), Offset(Vector)
+GeometryNodeMeshTriangle: outputs Mesh(Geometry). inputs: Size(Vector)
+GeometryNodeCurvePrimitiveLine: outputs Curve(Geometry). inputs: Start(Vector), End(Vector)
+GeometryNodeCurvePrimitiveCircle: outputs Curve(Geometry). inputs: Mode(Enum), Radius(Float), Resolution(Int)
+GeometryNodeCurvePrimitiveQuadrilateral: outputs Curve(Geometry). inputs: Mode(Enum), Start(Vector), Side 1(Vector), Side 2(Vector)
+GeometryNodeCurvePrimitiveRectangle: outputs Curve(Geometry). inputs: Mode(Enum), Width(Float), Height(Float), Corners Radius(Float)
 
 --- Geometry Operations ---
 GeometryNodeJoinGeometry: inputs Geometry(Geometry). outputs Geometry(Geometry)
 GeometryNodeTransform: inputs Geometry(Geometry), Translation(Vector), Rotation(Vector), Scale(Vector). outputs Geometry(Geometry)
-GeometryNodeSetPosition: inputs Geometry(Geometry), Position(Vector), Offset(Vector). outputs Geometry(Geometry)
-GeometryNodeSetMaterial: inputs Geometry(Geometry), Material(Material). outputs Geometry(Geometry)
+GeometryNodeSetPosition: inputs Geometry(Geometry), Position(Vector), Offset(Vector), Selection(Bool). outputs Geometry(Geometry)
+GeometryNodeSetMaterial: inputs Geometry(Geometry), Material(Material), Selection(Bool). outputs Geometry(Geometry)
 GeometryNodeSubdivisionSurface: inputs Geometry(Geometry), Level(Int). outputs Geometry(Geometry)
+GeometryNodeBoolean: inputs Mesh 1(Geometry), Mesh 2(Geometry), Solver(Enum). outputs Mesh(Geometry). properties: operation = "UNION"|"DIFFERENCE"|"INTERSECT"
+GeometryNodeExtrudeMesh: inputs Mesh(Geometry), Selection(Bool), Offset(Float), Thickness(Float), Individual(Bool). outputs Mesh(Geometry)
+GeometryNodeDeleteGeometry: inputs Geometry(Geometry), Selection(Bool). outputs Geometry(Geometry). properties: domain = "AUTO"|"POINT"|"EDGE"|"FACE"|"INSTANCE"
+GeometryNodeSplitToInstances: inputs Geometry(Geometry), Selection(Bool). outputs Instances(Geometry). properties: domain = "AUTO"|"POINT"|"EDGE"|"FACE"
+GeometryNodeMergeByDistance: inputs Geometry(Geometry), Selection(Bool), Distance(Float). outputs Geometry(Geometry)
+GeometryNodeSeparateGeometry: inputs Geometry(Geometry), Selection(Bool). outputs Geometry(Geometry), Inverted(Geometry). properties: domain = "AUTO"|"POINT"|"EDGE"|"FACE"|"INSTANCE"
+GeometryNodeDualMesh: inputs Mesh(Geometry). outputs Mesh(Geometry)
+GeometryNodeTriangulate: inputs Mesh(Geometry), Selection(Bool). outputs Mesh(Geometry)
+GeometryNodeConvexHull: inputs Geometry(Geometry), Position(Vector). outputs Geometry(Geometry), Vertices(Geometry), Edges(Geometry), Triangles(Geometry)
+GeometryNodeBoundingBox: inputs Geometry(Geometry). outputs Bounding Box(Geometry), Min(Vector), Max(Vector), Size(Vector), Center(Vector)
+
+--- Curve Operations ---
+GeometryNodeCurveToMesh: inputs Curve(Geometry), Profile Curve(Geometry), Fill Caps(Bool). outputs Mesh(Geometry)
+GeometryNodeCurveToPoints: inputs Curve(Geometry), Mode(Enum). outputs Points(Geometry). properties: mode = "EVALUATED"|"CONTROL_POINTS"
+GeometryNodePointsToCurves: inputs Points(Geometry). outputs Curves(Geometry)
+GeometryNodeResampleCurve: inputs Curve(Geometry), Mode(Enum), Count(Int), Length(Float). outputs Curve(Geometry). properties: mode = "COUNT"|"LENGTH"
+GeometryNodeSubdivideCurve: inputs Curve(Geometry), Cuts(Int). outputs Curve(Geometry)
+GeometryNodeTrimCurve: inputs Curve(Geometry), Mode(Enum), Start(Float), End(Float), Length(Float). outputs Curve(Geometry). properties: mode = "FACTOR"|"LENGTH"
+GeometryNodeFilletCurve: inputs Curve(Geometry), Selection(Bool), Radius(Float), Segments(Int). outputs Curve(Geometry)
+GeometryNodeInterpolateCurves: inputs Curve 1(Geometry), Curve 2(Geometry), Factor(Float). outputs Curve(Geometry)
+GeometryNodeOffsetPointInCurve: inputs Curve(Geometry), Factor(Float), Offset(Float). outputs Vector(Vector)
+GeometryNodeSplineParameter: inputs Spline(Geometry), Factor(Float). outputs Position(Vector), Tangent(Vector), Normal(Vector), Curvature(Float)
+GeometryNodeSplineType: inputs Curve(Geometry). outputs Curve(Geometry). properties: type = "POLY"|"BEZIER"|"NURBS"|"CARDINAL"
+GeometryNodeSetCurveRadius: inputs Curve(Geometry), Value(Float), Selection(Bool). outputs Curve(Geometry)
+GeometryNodeSetCurveTilt: inputs Curve(Geometry), Value(Float), Selection(Bool). outputs Curve(Geometry)
+GeometryNodeSetHandleType: inputs Curve(Geometry), Handle Type(Enum), Selection(Bool). outputs Curve(Geometry). properties: handle_type = "AUTO"|"VECTOR"|"ALIGN"|"FREE_ALIGN"
+GeometryNodeSetSplineResolution: inputs Curve(Geometry), Resolution(Int), Selection(Bool). outputs Curve(Geometry)
+GeometryNodeReverseCurve: inputs Curve(Geometry), Selection(Bool). outputs Curve(Geometry)
 
 --- Instances ---
-GeometryNodeInstanceOnPoints: inputs Points(Geometry), Instance(Geometry), Scale(Vector), Rotation(Vector). outputs Instances(Geometry)
+GeometryNodeInstanceOnPoints: inputs Points(Geometry), Instance(Geometry), Selection(Bool), Pick Instance(Bool), Instance Index(Int), Position(Vector), Rotation(Vector), Scale(Vector), Random ID(Int). outputs Instances(Geometry)
 GeometryNodeRealizeInstances: inputs Geometry(Geometry). outputs Geometry(Geometry)
+GeometryNodeInstancesToPoints: inputs Instances(Geometry). outputs Points(Geometry)
+GeometryNodeImageInfo: outputs Width(Int), Height(Int), Color Space(Enum), Has Alpha(Bool), Frame Count(Int), Is Animated(Bool)
+GeometryNodeImageTexture: inputs Vector(Vector), Image(Image). outputs Color(Color), Alpha(Float)
 
 --- Points ---
-GeometryNodeDistributePointsOnFaces: inputs Mesh(Geometry), Density(Float). outputs Points(Geometry), Normal(Vector), Rotation(Vector)
+GeometryNodeDistributePointsOnFaces: inputs Mesh(Geometry), Selection(Bool), Density(Float), Density Max(Float), Seed(Int). outputs Points(Geometry). properties: distribute_method = "RANDOM"|"POISSON_DISK"
+GeometryNodePointsToVertices: inputs Points(Geometry). outputs Mesh(Geometry)
 
 --- Inputs ---
 GeometryNodeInputPosition: outputs Position(Vector)
 GeometryNodeInputNormal: outputs Normal(Vector)
 GeometryNodeInputIndex: outputs Index(Int)
+GeometryNodeInputNamedAttribute: inputs Name(String). outputs Value(varies), Exists(Bool). properties: data_type = "AUTO"|"FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION"
+GeometryNodeInputSceneTime: outputs Time(Float), Frame(Float), Delta Time(Float)
+GeometryNodeInputActiveCamera: outputs Camera(Object)
+GeometryNodeObjectInfo: inputs Object(Object). outputs Geometry(Geometry), Transform(Matrix), Location(Vector), Rotation(Vector), Scale(Vector)
+GeometryNodeCollectionInfo: inputs Collection(Collection), Reset Children(Bool). outputs Instances(Geometry)
+GeometryNodeCameraInfo: outputs View Vector(Vector), View Z Depth(Float), View Distance(Float)
+GeometryNodeIsViewport: outputs Is Viewport(Bool)
+
+--- Attribute Operations ---
+GeometryNodeStoreNamedAttribute: inputs Geometry(Geometry), Selection(Bool), Name(String), Value(varies). outputs Geometry(Geometry). properties: data_type = "FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION", domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"
+GeometryNodeCaptureAttribute: inputs Geometry(Geometry), Selection(Bool), Value(varies). outputs Geometry(Geometry), Captured(varies). properties: data_type = "FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION", domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"
+GeometryNodeNamedAttribute: inputs Name(String). outputs Value(varies), Exists(Bool). properties: data_type = "AUTO"|"FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION"
+GeometryNodeRemoveAttribute: inputs Geometry(Geometry), Selection(Bool), Name(String). outputs Geometry(Geometry). properties: domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"
+GeometryNodeFieldAtIndex: inputs Value(varies), Index(Int). outputs Value(varies). properties: data_type = "FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION", domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"
+GeometryNodeDomainSize: inputs Geometry(Geometry). outputs Size(Int). properties: domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"|"SPLINE"|"CURVE"
+
+--- Simulation / Repeat ---
+GeometryNodeSimulationInput: inputs Geometry(Geometry). outputs Geometry(Geometry)
+GeometryNodeSimulationOutput: outputs Geometry(Geometry)
+GeometryNodeRepeatInput: outputs Geometry(Geometry), Iteration Number(Int)
+GeometryNodeRepeatOutput: inputs Geometry(Geometry). outputs Geometry(Geometry)
+GeometryNodeForEachElementInput: outputs Geometry(Geometry), Index(Int), Total Count(Int)
+GeometryNodeForEachElementOutput: inputs Geometry(Geometry). outputs Geometry(Geometry)
+
+--- Viewport Display ---
+GeometryNodeViewer: inputs Geometry(Geometry), Value(varies). outputs Geometry(Geometry). properties: data_type = "FLOAT"|"INT"|"FLOAT_VECTOR"|"FLOAT_COLOR"|"QUATERNION", domain = "POINT"|"EDGE"|"FACE"|"CORNER"|"INSTANCE"
+
+--- Matrix / Transform ---
+FunctionNodeTransformPoint: inputs Transform(Matrix), Point(Vector). outputs Point(Vector)
+FunctionNodeTransformDirection: inputs Transform(Matrix), Direction(Vector). outputs Direction(Vector)
+FunctionNodeInvertMatrix: inputs Matrix(Matrix). outputs Inverse(Matrix)
+FunctionNodeCombineMatrix: inputs Row 1(Vector), Row 2(Vector), Row 3(Vector), Row 4(Vector). outputs Matrix(Matrix)
+FunctionNodeSeparateMatrix: inputs Matrix(Matrix). outputs Row 1(Vector), Row 2(Vector), Row 3(Vector), Row 4(Vector)
+FunctionNodeRotateEuler: inputs Rotation(Vector), Rotate By(Vector), Type(Enum). outputs Rotation(Vector). properties: type = "XYZ"|"XZY"|"YXZ"|"YZX"|"ZXY"|"ZYX"|"QUATERNION_AXIS_ANGLE"
+FunctionNodeAlignEulerToVector: inputs Vector(Vector), Axis(Enum), Pivot Axis(Enum). outputs Rotation(Vector). properties: axis = "X"|"Y"|"Z", pivot_axis = "X"|"Y"|"Z"
+FunctionNodeProjectPoint: inputs Point(Vector), Start Point(Vector), End Point(Vector). outputs Result(Vector), Factor(Float), Distance(Float)
 
 --- Math (shared with Shader) ---
 ShaderNodeMath: inputs Value(Float), Value(Float). outputs Value(Float). properties: operation
@@ -706,7 +1003,8 @@ User: Ghibli-style grass shader with vertex attribute color, noise variation, an
 ]}
 """
 
-_STEP1_SYSTEM_SHADER = """You are a Blender 5.0 shader node expert.
+_STEP1_SYSTEM_SHADER = (
+    """You are a Blender 5.0 shader node expert.
 Given a material description, output a JSON object listing the nodes needed.
 
 RULES:
@@ -719,7 +1017,10 @@ RULES:
 - Do NOT include links — only nodes. Links will be specified separately.
 - Output raw JSON only. No explanation.
 
-""" + SHADER_NODE_REFERENCE + _FEW_SHOT_SHADER_STEP1
+"""
+    + SHADER_NODE_REFERENCE
+    + _FEW_SHOT_SHADER_STEP1
+)
 
 _FEW_SHOT_GEO_STEP1 = """
 EXAMPLE (verified working setup — follow this exact schema):
@@ -743,7 +1044,8 @@ User: Distribute grass object collection on a surface with random scale and rota
 ]}
 """
 
-_STEP1_SYSTEM_GEOMETRY = """You are a Blender 5.0 geometry nodes expert.
+_STEP1_SYSTEM_GEOMETRY = (
+    """You are a Blender 5.0 geometry nodes expert.
 Given a description of a procedural effect, output a JSON object listing the nodes needed.
 
 RULES:
@@ -760,7 +1062,10 @@ OUTPUT TOPOLOGY RULE (mandatory):
   [any geometry producer] → join_geo → group_output
   group_input.Geometry   → join_geo  (always)
 
-""" + GEOMETRY_NODE_REFERENCE + _FEW_SHOT_GEO_STEP1
+"""
+    + GEOMETRY_NODE_REFERENCE
+    + _FEW_SHOT_GEO_STEP1
+)
 
 # Step 2: Link connection prompt (socket info injected dynamically)
 _STEP2_SYSTEM = """You are a Blender 5.0 node connection expert.
@@ -856,13 +1161,13 @@ _NODE_SCHEMA = {
                     "bl_idname": {"type": "string"},
                     "label": {"type": "string"},
                     "properties": {"type": "object"},
-                    "inputs": {"type": "object"}
+                    "inputs": {"type": "object"},
                 },
-                "required": ["id", "bl_idname"]
-            }
-        }
+                "required": ["id", "bl_idname"],
+            },
+        },
     },
-    "required": ["nodes"]
+    "required": ["nodes"],
 }
 
 
@@ -881,18 +1186,20 @@ def _build_link_schema(node_ids: list[str]) -> dict:
                         "to_node": {"type": "string", "enum": node_ids},
                         "to_socket": {"type": "string"},
                     },
-                    "required": ["from_node", "from_socket", "to_node", "to_socket"]
-                }
+                    "required": ["from_node", "from_socket", "to_node", "to_socket"],
+                },
             }
         },
-        "required": ["links"]
+        "required": ["links"],
     }
 
 
 # === OLLAMA API ===
 
-def _ollama_request_sync(base_url: str, model: str, messages: list[dict],
-                         format_schema: dict | None = None) -> str:
+
+def _ollama_request_sync(
+    base_url: str, model: str, messages: list[dict], format_schema: dict | None = None
+) -> str:
     """
     Collects a full Ollama response as a single string.
     Uses stream=True internally so the abort flag is checked between tokens.
@@ -902,7 +1209,7 @@ def _ollama_request_sync(base_url: str, model: str, messages: list[dict],
     payload: dict = {
         "model": model,
         "messages": messages,
-        "stream": True,   # stream so we can abort between tokens
+        "stream": True,  # stream so we can abort between tokens
         "keep_alive": "5m",  # how long Ollama holds the model in VRAM after use (set "0" to unload immediately)
     }
     if format_schema:
@@ -910,7 +1217,8 @@ def _ollama_request_sync(base_url: str, model: str, messages: list[dict],
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data,
+        url,
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -944,14 +1252,17 @@ def _ollama_request_sync(base_url: str, model: str, messages: list[dict],
 def _ollama_request_stream(base_url: str, model: str, messages: list[dict]):
     """Streaming POST to Ollama. Yields content tokens."""
     url = f"{base_url.rstrip('/')}/api/chat"
-    payload = json.dumps({
-        "model": model,
-        "messages": messages,
-        "stream": True,
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+        }
+    ).encode("utf-8")
 
     req = urllib.request.Request(
-        url, data=payload,
+        url,
+        data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -982,6 +1293,7 @@ def _ollama_request_stream(base_url: str, model: str, messages: list[dict]):
 
 # === BACKGROUND: ANALYZE (unchanged) ===
 
+
 def _bg_analyze(base_url, model, messages):
     try:
         for token in _ollama_request_stream(base_url, model, messages):
@@ -1001,7 +1313,285 @@ def _bg_analyze(base_url, model, messages):
         _state.dirty = True
 
 
+# === NODE TREE IMPORTER (JSON → Blender) ===
+
+
+def _resolve_socket_import(
+    collection,
+    old_id: str,
+    name: str,
+    index,
+    interface_id_map: dict,
+    group_id_maps: dict | None = None,
+    group_node=None,
+):
+    """Return the best-matching socket from *collection*.
+
+    Works correctly for both standard nodes and group boundary nodes
+    (NodeGroupInput / NodeGroupOutput) whose identifiers change on every
+    interface rebuild. Mirrors json_mover.py's _resolve_socket.
+    """
+    if (
+        group_node is not None
+        and group_id_maps
+        and hasattr(group_node, "node_tree")
+        and group_node.node_tree
+    ):
+        grp_map = group_id_maps.get(group_node.node_tree.name, {})
+        mapped_id = grp_map.get(old_id, old_id)
+        sock = collection.get(mapped_id)
+        if sock:
+            return sock
+
+    mapped_id = interface_id_map.get(old_id, old_id)
+    sock = collection.get(mapped_id)
+    if sock:
+        return sock
+
+    if mapped_id != old_id:
+        sock = collection.get(old_id)
+        if sock:
+            return sock
+
+    name_matches = []
+    for s in collection:
+        if s.identifier == mapped_id or s.identifier == old_id:
+            return s
+        if s.name == name:
+            name_matches.append(s)
+
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    if index is not None and index < len(collection):
+        return collection[index]
+
+    if name_matches:
+        return name_matches[0]
+
+    return None
+
+
+def _ensure_embedded_groups_import(embedded: dict) -> dict:
+    """Recreate sub-node-groups embedded in an exported JSON.
+
+    Two-pass strategy mirroring json_mover.py:
+      Pass 1 — Create EMPTY SHELLS for groups that don't exist yet.
+      Pass 2 — Build the contents of only the newly-created shells.
+
+    Returns a dict ``{group_name: {old_id: new_id}}`` mapping exported interface
+    identifiers to the Blender-generated ones.
+    """
+    group_id_maps = {}
+    to_build = []
+    for group_name, group_data in embedded.items():
+        if not group_data:
+            continue
+        if group_name not in bpy.data.node_groups:
+            group_type = group_data.get("tree_type", "GeometryNodeTree")
+            bpy.data.node_groups.new(name=group_name, type=group_type)
+            to_build.append(group_name)
+
+    for group_name in to_build:
+        ng = bpy.data.node_groups[group_name]
+        id_map = _build_node_tree_from_json(ng, embedded[group_name])
+        group_id_maps[group_name] = id_map
+
+    return group_id_maps
+
+
+def _build_node_tree_from_json(node_tree: bpy.types.NodeTree, data: dict) -> dict:
+    """Build a node tree from a JSON data dict (the format produced by serialize_node_tree).
+
+    This is the import counterpart to serialize_node_tree. It handles:
+    - Interface recreation with identifier mapping
+    - Embedded sub-node-groups (two-pass to avoid .001 duplicates)
+    - Dynamic node items (capture_items, store_items, repeat_items, simulation_items)
+    - Parent frame resolution (deferred to second-pass)
+    - Socket resolution via identifiers with fallback chain
+    - GeometryNodeGroup node_tree assignment retry in second-pass
+
+    Returns interface_id_map mapping old identifiers to new ones.
+    """
+    node_tree.nodes.clear()
+    created_nodes = {}
+
+    # Ensure any embedded sub-groups exist before we try to assign node.node_tree
+    embedded = data.get("embedded_groups", {})
+    group_id_maps = {}
+    if embedded:
+        group_id_maps = _ensure_embedded_groups_import(embedded)
+
+    # Recreate interface (needed for Group Input/Output nodes)
+    interface_id_map = {}
+    if hasattr(node_tree, "interface") and "interface" in data:
+        node_tree.interface.clear()
+        for idata in data["interface"]:
+            try:
+                new_sock = node_tree.interface.new_socket(
+                    name=idata["name"],
+                    in_out=idata["in_out"],
+                    socket_type=idata["socket_type"],
+                )
+                if "identifier" in idata and idata["identifier"]:
+                    interface_id_map[idata["identifier"]] = new_sock.identifier
+            except Exception as e:
+                print(f"[qna] Error creating interface socket {idata.get('name')}: {e}")
+
+    # Create nodes
+    for n_data in data.get("nodes", []):
+        try:
+            node = node_tree.nodes.new(n_data["bl_idname"])
+        except RuntimeError:
+            print(f"[qna] Node type {n_data['bl_idname']} not supported. Skipping.")
+            continue
+
+        node.name = n_data["name"]
+        node.width = n_data.get("width", 140.0)
+
+        if "use_custom_color" in n_data:
+            node.use_custom_color = n_data["use_custom_color"]
+        if "color" in n_data:
+            node.color = n_data["color"]
+
+        # Dynamic node items MUST be done before socket resolution
+        for col_name, extracted_col in n_data.get("node_items", {}).items():
+            if hasattr(node, col_name):
+                col = getattr(node, col_name)
+                col.clear()
+                for item_data in extracted_col:
+                    dt = item_data.get("data_type", "FLOAT")
+                    name = item_data.get("name", "")
+                    try:
+                        new_item = col.new(dt, name)
+                        for k, v in item_data.items():
+                            if hasattr(new_item, k):
+                                d_v = _deserialize_val(v)
+                                if d_v is not None:
+                                    try:
+                                        setattr(new_item, k, d_v)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        print(f"[qna] Failed to create item in {col_name}: {e}")
+
+        # Properties (defer parent and active_item to second-pass)
+        for k, v in n_data.get("properties", {}).items():
+            if k in ("parent", "active_item"):
+                continue
+            if hasattr(node, k):
+                try:
+                    deserialized_val = _deserialize_val(v)
+                    if type(deserialized_val) == list and type(
+                        getattr(node, k)
+                    ).__name__ in ("Color", "Vector", "Euler"):
+                        setattr(node, k, deserialized_val)
+                    elif deserialized_val is not None:
+                        setattr(node, k, deserialized_val)
+                except Exception as e:
+                    print(f"[qna] Could not set {k} on {node.name}: {e}")
+
+        # Default socket values
+        for sock_entry in n_data.get("inputs", []):
+            sock_id = sock_entry.get("identifier", "")
+            idx = sock_entry.get("index", 0)
+            val = sock_entry.get("default_value")
+            deserialized_val = _deserialize_val(val)
+
+            target_sock = None
+            if sock_id and sock_id in node.inputs:
+                target_sock = node.inputs[sock_id]
+            elif idx < len(node.inputs):
+                target_sock = node.inputs[idx]
+
+            if (
+                target_sock
+                and hasattr(target_sock, "default_value")
+                and deserialized_val is not None
+            ):
+                try:
+                    if type(deserialized_val) == list:
+                        target_sock.default_value = deserialized_val
+                    else:
+                        target_sock.default_value = deserialized_val
+                except Exception:
+                    pass
+
+        created_nodes[node.name] = node
+
+    # Second-pass: resolve parent frames, set locations, retry node_tree assignments
+    for n_data in data.get("nodes", []):
+        node = created_nodes.get(n_data["name"])
+        if node is None:
+            continue
+
+        parent_name = n_data.get("parent") or n_data.get("properties", {}).get("parent")
+        if parent_name:
+            parent_node = created_nodes.get(parent_name)
+            if parent_node:
+                try:
+                    node.parent = parent_node
+                except Exception as e:
+                    print(f"[qna] Could not set parent on {node.name}: {e}")
+
+        loc = n_data.get("location", [0, 0])
+        if isinstance(loc, (list, tuple)) and len(loc) >= 2:
+            node.location = (float(loc[0]), float(loc[1]))
+
+        # Retry node_tree assignment for GeometryNodeGroup nodes
+        if n_data.get("bl_idname") != "GeometryNodeGroup":
+            continue
+        if node.node_tree is not None:
+            continue
+        nt_ref = n_data.get("properties", {}).get("node_tree")
+        if nt_ref:
+            resolved = _deserialize_val(nt_ref)
+            if resolved is not None:
+                try:
+                    node.node_tree = resolved
+                except Exception as e:
+                    print(f"[qna] Second-pass node_tree failed for '{node.name}': {e}")
+
+    # Links
+    for l_data in data.get("links", []):
+        from_node = created_nodes.get(l_data["from_node"])
+        to_node = created_nodes.get(l_data["to_node"])
+        if not (from_node and to_node):
+            continue
+
+        f_sock = _resolve_socket_import(
+            from_node.outputs,
+            l_data["from_socket"],
+            l_data.get("from_socket_name", ""),
+            l_data.get("from_socket_index"),
+            interface_id_map,
+            group_id_maps,
+            from_node,
+        )
+        t_sock = _resolve_socket_import(
+            to_node.inputs,
+            l_data["to_socket"],
+            l_data.get("to_socket_name", ""),
+            l_data.get("to_socket_index"),
+            interface_id_map,
+            group_id_maps,
+            to_node,
+        )
+
+        if f_sock and t_sock:
+            try:
+                node_tree.links.new(f_sock, t_sock)
+            except Exception as e:
+                print(
+                    f"[qna] Failed to link {from_node.name}:{f_sock.name} "
+                    f"→ {to_node.name}:{t_sock.name}: {e}"
+                )
+
+    return interface_id_map
+
+
 # === JSON EXTRACTION ===
+
 
 def _extract_json(text: str) -> dict | None:
     """Robustly extract a JSON object from LLM output."""
@@ -1046,8 +1636,8 @@ def _extract_json(text: str) -> dict | None:
 
 # === 2-STEP CONSTRAINED GENERATION ===
 
-def _bg_generate_step1(base_url: str, model: str, user_prompt: str,
-                       tree_type: str):
+
+def _bg_generate_step1(base_url: str, model: str, user_prompt: str, tree_type: str):
     """
     Step 1: Ask LLM to pick nodes. Uses schema enforcement so the
     output is guaranteed to be structurally valid JSON.
@@ -1066,8 +1656,9 @@ def _bg_generate_step1(base_url: str, model: str, user_prompt: str,
             {"role": "user", "content": user_prompt},
         ]
 
-        raw = _ollama_request_sync(base_url, model, messages,
-                                   format_schema=_NODE_SCHEMA)
+        raw = _ollama_request_sync(
+            base_url, model, messages, format_schema=_NODE_SCHEMA
+        )
 
         if _state.abort_requested:
             _state.error = "Aborted."
@@ -1095,9 +1686,7 @@ def _bg_generate_step1(base_url: str, model: str, user_prompt: str,
             _state.dirty = True
             return
 
-        _state.raw_response = (
-            f"Step 1/2: Got {len(nodes)} nodes. Building…\n"
-        )
+        _state.raw_response = f"Step 1/2: Got {len(nodes)} nodes. Building…\n"
         _state.pending_phase1 = spec
         _state.gen_phase = "building"
         _state.dirty = True
@@ -1114,8 +1703,9 @@ def _bg_generate_step1(base_url: str, model: str, user_prompt: str,
         _state.dirty = True
 
 
-def _bg_generate_step2(base_url: str, model: str, user_prompt: str,
-                       socket_info: str, node_ids: list[str]):
+def _bg_generate_step2(
+    base_url: str, model: str, user_prompt: str, socket_info: str, node_ids: list[str]
+):
     """
     Step 2: Given real socket info from Blender, ask LLM to connect them.
     Node IDs are constrained via JSON schema enum.
@@ -1140,8 +1730,7 @@ def _bg_generate_step2(base_url: str, model: str, user_prompt: str,
             {"role": "user", "content": user_msg},
         ]
 
-        raw = _ollama_request_sync(base_url, model, messages,
-                                   format_schema=link_schema)
+        raw = _ollama_request_sync(base_url, model, messages, format_schema=link_schema)
 
         if _state.abort_requested:
             _state.error = "Aborted."
@@ -1169,9 +1758,7 @@ def _bg_generate_step2(base_url: str, model: str, user_prompt: str,
             _state.dirty = True
             return
 
-        _state.raw_response = (
-            f"Step 2/2: Got {len(links)} links. Connecting…\n"
-        )
+        _state.raw_response = f"Step 2/2: Got {len(links)} links. Connecting…\n"
         _state.pending_phase2 = spec
         _state.gen_phase = "linking"
         _state.dirty = True
@@ -1190,8 +1777,10 @@ def _bg_generate_step2(base_url: str, model: str, user_prompt: str,
 
 # === SOCKET INFO READER ===
 
-def _read_socket_info(node_tree: bpy.types.NodeTree,
-                      id_to_node: dict[str, bpy.types.Node]) -> str:
+
+def _read_socket_info(
+    node_tree: bpy.types.NodeTree, id_to_node: dict[str, bpy.types.Node]
+) -> str:
     """
     Read REAL socket names from built Blender nodes and format them
     as a clear reference for the LLM's step 2.
@@ -1220,13 +1809,96 @@ def _read_socket_info(node_tree: bpy.types.NodeTree,
 # === NODE BUILDER (type-safe) ===
 
 _SOCKET_ALIASES = {
-    "fac": "Factor", "fac.": "Factor",
-    "shader_1": "Shader", "shader_2": "Shader",
-    "shader 1": "Shader", "shader 2": "Shader",
-    "base color": "Base Color", "val": "Value",
-    "col": "Color", "vec": "Vector", "bsdf": "BSDF",
-    "result": "Result", "dist": "Distance",
-    "rough": "Roughness", "emission": "Emission",
+    "fac": "Factor",
+    "fac.": "Factor",
+    "shader_1": "Shader",
+    "shader_2": "Shader",
+    "shader 1": "Shader",
+    "shader 2": "Shader",
+    "base color": "Base Color",
+    "val": "Value",
+    "col": "Color",
+    "vec": "Vector",
+    "bsdf": "BSDF",
+    "result": "Result",
+    "dist": "Distance",
+    "rough": "Roughness",
+    "emission": "Emission",
+    "geo": "Geometry",
+    "geometry": "Geometry",
+    "pts": "Points",
+    "points": "Points",
+    "inst": "Instances",
+    "instances": "Instances",
+    "mesh": "Mesh",
+    "position": "Position",
+    "pos": "Position",
+    "normal": "Normal",
+    "norm": "Normal",
+    "rotation": "Rotation",
+    "rot": "Rotation",
+    "scale": "Scale",
+    "density": "Density",
+    "selection": "Selection",
+    "sel": "Selection",
+    "attribute": "Attribute",
+    "attr": "Attribute",
+    "name": "Name",
+    "material": "Material",
+    "mat": "Material",
+    "object": "Object",
+    "obj": "Object",
+    "collection": "Collection",
+    "coll": "Collection",
+    "image": "Image",
+    "img": "Image",
+    "transform": "Transform",
+    "matrix": "Matrix",
+    "invert": "Invert",
+    "multiply": "Multiply",
+    "mul": "Multiply",
+    "add": "Add",
+    "subtract": "Subtract",
+    "sub": "Subtract",
+    "divide": "Divide",
+    "div": "Divide",
+    "power": "Power",
+    "pow": "Power",
+    "absolute": "Absolute",
+    "abs": "Absolute",
+    "min": "Min",
+    "max": "Max",
+    "clamp": "Clamp",
+    "mix": "Mix",
+    "blend": "Mix",
+    "compare": "Compare",
+    "cmp": "Compare",
+    "random": "Random",
+    "rand": "Random",
+    "noise": "Noise",
+    "curve": "Curve",
+    "spline": "Spline",
+    "handle": "Handle Type",
+    "resolution": "Resolution",
+    "trim": "Trim",
+    "start": "Start",
+    "end": "End",
+    "length": "Length",
+    "radius": "Radius",
+    "tangent": "Tangent",
+    "curvature": "Curvature",
+    "twist": "Twist",
+    "tilt": "Tilt",
+    "weight": "Weight",
+    "id": "ID",
+    "boolean": "Boolean",
+    "bool": "Boolean",
+    "int": "Integer",
+    "integer": "Integer",
+    "float": "Float",
+    "string": "String",
+    "color": "Color",
+    "vector": "Vector",
 }
 
 
@@ -1297,18 +1969,16 @@ def _ensure_geometry_structure(tree, id_to_node: dict, log: list) -> dict:
     exist as Blender nodes, creating any that are missing.
     Returns the updated id_to_node dict.
     """
+
     def _find_or_create(bl_id, node_id, label):
-        # First check id_to_node
         node = id_to_node.get(node_id)
         if node:
             return node
-        # Then scan tree by bl_idname
         for n in tree.nodes:
             if n.bl_idname == bl_id:
-                n.name = node_id   # critical: rename so linking phase finds it by name
+                n.name = node_id
                 id_to_node[node_id] = n
                 return n
-        # Create it
         node = tree.nodes.new(bl_id)
         node.name = node_id
         node.label = label
@@ -1316,72 +1986,87 @@ def _ensure_geometry_structure(tree, id_to_node: dict, log: list) -> dict:
         log.append(f"AUTO  Created {bl_id} '{node_id}'")
         return node
 
-    _find_or_create("NodeGroupInput",           "group_input", "Group Input")
-    _find_or_create("NodeGroupOutput",          "group_output", "Group Output")
-    _find_or_create("GeometryNodeJoinGeometry", "join_geo",    "Join Geometry")
+    _find_or_create("NodeGroupInput", "group_input", "Group Input")
+    _find_or_create("NodeGroupOutput", "group_output", "Group Output")
+    # Only create join_geo if it doesn't already exist — some setups don't need it
+    if "join_geo" not in id_to_node:
+        for n in tree.nodes:
+            if n.bl_idname == "GeometryNodeJoinGeometry":
+                id_to_node["join_geo"] = n
+                break
+        else:
+            _find_or_create("GeometryNodeJoinGeometry", "join_geo", "Join Geometry")
     return id_to_node
 
 
 def _fix_geometry_output_links(tree, id_to_node: dict, log: list) -> None:
     """
     After the LLM has created links for a geometry node tree, enforce:
-      1. group_input.Geometry → join_geo  (if not already connected)
-      2. Any link going directly into group_output.Geometry that does NOT
-         come from join_geo is rerouted: source → join_geo instead.
-      3. join_geo.Geometry → group_output.Geometry  (if not already connected)
-    """
-    group_input  = id_to_node.get("group_input")
-    group_output = id_to_node.get("group_output")
-    join_geo     = id_to_node.get("join_geo")
+      1. group_input.Geometry feeds into the geometry pipeline
+      2. group_output.Geometry receives exactly one Geometry link
+      3. join_geo acts as the final collector if it exists
 
-    if not all([group_input, group_output, join_geo]):
-        log.append("WARN  geometry structure incomplete — skipping output link enforcement")
+    Only intervenes when group_output has NO geometry input (missing link)
+    or has multiple conflicting inputs. Does NOT reroute valid topologies.
+    """
+    group_input = id_to_node.get("group_input")
+    group_output = id_to_node.get("group_output")
+    join_geo = id_to_node.get("join_geo")
+
+    if not all([group_input, group_output]):
+        log.append(
+            "WARN  geometry structure incomplete — skipping output link enforcement"
+        )
         return
 
     geo_out_input = _find_socket(group_output.inputs, "Geometry")
-    join_geo_in   = _find_socket(join_geo.inputs,     "Geometry")
-    join_geo_out  = _find_socket(join_geo.outputs,    "Geometry")
-    gi_geo_out    = _find_socket(group_input.outputs, "Geometry")
-
-    if not all([geo_out_input, join_geo_in, join_geo_out]):
-        log.append("WARN  could not find required Geometry sockets — skipping")
+    if not geo_out_input:
+        log.append("WARN  could not find Geometry output socket — skipping")
         return
 
-    # 1. Reroute any direct X → group_output (not from join_geo) through join_geo
-    to_remove = []
-    for link in list(tree.links):
-        if link.to_socket == geo_out_input and link.from_node != join_geo:
-            src = link.from_socket
-            to_remove.append(link)
-            already = any(lk.from_socket == src and lk.to_node == join_geo
-                          for lk in tree.links)
-            if not already:
-                tree.links.new(src, join_geo_in)
-                log.append(f"AUTO  Rerouted {src.node.name} → join_geo (was → group_output)")
-    for lk in to_remove:
-        tree.links.remove(lk)
+    # Check what's currently connected to group_output.Geometry
+    existing_links = [lk for lk in tree.links if lk.to_socket == geo_out_input]
 
-    # 2. group_input.Geometry → join_geo
-    if gi_geo_out:
-        already = any(lk.from_socket == gi_geo_out and lk.to_node == join_geo
-                      for lk in tree.links)
-        if not already:
-            tree.links.new(gi_geo_out, join_geo_in)
-            log.append("AUTO  Connected group_input.Geometry → join_geo")
+    # If nothing is connected, try to wire up join_geo or group_input
+    if not existing_links:
+        if join_geo:
+            join_geo_out = _find_socket(join_geo.outputs, "Geometry")
+            join_geo_in = _find_socket(join_geo.inputs, "Geometry")
+            gi_geo_out = _find_socket(group_input.outputs, "Geometry")
+            if join_geo_out and join_geo_in:
+                tree.links.new(join_geo_out, geo_out_input)
+                log.append("AUTO  Connected join_geo.Geometry → group_output")
+                if gi_geo_out:
+                    already = any(
+                        lk.from_socket == gi_geo_out and lk.to_node == join_geo
+                        for lk in tree.links
+                    )
+                    if not already:
+                        tree.links.new(gi_geo_out, join_geo_in)
+                        log.append("AUTO  Connected group_input.Geometry → join_geo")
+        else:
+            gi_geo_out = _find_socket(group_input.outputs, "Geometry")
+            if gi_geo_out:
+                tree.links.new(gi_geo_out, geo_out_input)
+                log.append(
+                    "AUTO  Connected group_input.Geometry → group_output (no join_geo)"
+                )
 
-    # 3. join_geo → group_output
-    already = any(lk.from_socket == join_geo_out and lk.to_node == group_output
-                  for lk in tree.links)
-    if not already:
-        tree.links.new(join_geo_out, geo_out_input)
-        log.append("AUTO  Connected join_geo.Geometry → group_output")
+    # If multiple things feed into group_output.Geometry, keep only the last one
+    elif len(existing_links) > 1:
+        for lk in existing_links[:-1]:
+            tree.links.remove(lk)
+        log.append("AUTO  Removed duplicate links to group_output.Geometry")
 
 
-def build_nodes_only(node_tree: bpy.types.NodeTree, spec: dict,
-                     clear_existing: bool = True) -> tuple[dict, list[str]]:
+def build_nodes_only(
+    node_tree: bpy.types.NodeTree, spec: dict, clear_existing: bool = True
+) -> tuple[dict, list[str]]:
     """
     Build nodes from spec WITHOUT creating links.
     Returns (id_to_node dict, log list).
+    Supports dynamic node items (capture_items, store_items, repeat_items, simulation_items)
+    for geometry nodes like Store Named Attribute, Capture Attribute, Repeat Zones, etc.
     """
     log: list[str] = []
 
@@ -1392,7 +2077,9 @@ def build_nodes_only(node_tree: bpy.types.NodeTree, spec: dict,
     id_to_node: dict[str, bpy.types.Node] = {}
     nodes_data = spec.get("nodes", [])
     if not isinstance(nodes_data, list):
-        log.append(f"WARN  'nodes' is {type(nodes_data).__name__}, expected list. Skipping.")
+        log.append(
+            f"WARN  'nodes' is {type(nodes_data).__name__}, expected list. Skipping."
+        )
         return id_to_node, log
 
     for i, ns in enumerate(nodes_data):
@@ -1424,6 +2111,39 @@ def build_nodes_only(node_tree: bpy.types.NodeTree, spec: dict,
                 except Exception as exc:
                     log.append(f"  WARN  {nid}.{prop_name}={prop_val}: {exc}")
 
+        # Dynamic node items (Capture Attribute, Store Named Attribute, Repeat Zones, Simulation Zones)
+        # MUST be done before socket resolution so that dynamic sockets appear
+        for col_name in (
+            "capture_items",
+            "store_items",
+            "repeat_items",
+            "simulation_items",
+        ):
+            if col_name in ns and hasattr(node, col_name):
+                col = getattr(node, col_name)
+                items_data = ns[col_name]
+                if isinstance(items_data, list):
+                    col.clear()
+                    for item_data in items_data:
+                        if not isinstance(item_data, dict):
+                            continue
+                        dt = item_data.get("data_type", "FLOAT")
+                        name = item_data.get("name", "")
+                        try:
+                            new_item = col.new(dt, name)
+                            for k, v in item_data.items():
+                                if hasattr(new_item, k):
+                                    d_v = _deserialize_val(v)
+                                    if d_v is not None:
+                                        try:
+                                            setattr(new_item, k, d_v)
+                                        except Exception:
+                                            pass
+                        except Exception as exc:
+                            log.append(
+                                f"  WARN  Failed to create {col_name} item on {nid}: {exc}"
+                            )
+
         # Input defaults
         inputs = _safe_dict(ns.get("inputs", {}), f"{nid}.inputs")
         for sock_name, sock_val in inputs.items():
@@ -1441,8 +2161,9 @@ def build_nodes_only(node_tree: bpy.types.NodeTree, spec: dict,
     return id_to_node, log
 
 
-def create_links(node_tree: bpy.types.NodeTree, spec: dict,
-                 id_to_node: dict) -> list[str]:
+def create_links(
+    node_tree: bpy.types.NodeTree, spec: dict, id_to_node: dict
+) -> list[str]:
     """Create links from a links spec, with smart resolution."""
     log: list[str] = []
     links_data = spec.get("links", [])
@@ -1477,11 +2198,11 @@ def create_links(node_tree: bpy.types.NodeTree, spec: dict,
             tn, tn_id = _find_node_by_label(tn_id, id_to_node)
 
         if not fn:
-            log.append(f"FAIL  from_node '{ls.get('from_node','')}' not found")
+            log.append(f"FAIL  from_node '{ls.get('from_node', '')}' not found")
             link_fail += 1
             continue
         if not tn:
-            log.append(f"FAIL  to_node '{ls.get('to_node','')}' not found")
+            log.append(f"FAIL  to_node '{ls.get('to_node', '')}' not found")
             link_fail += 1
             continue
 
@@ -1518,8 +2239,10 @@ def create_links(node_tree: bpy.types.NodeTree, spec: dict,
 
 # === LINK RESOLUTION HELPERS ===
 
-def _split_combined_ref(node_ref: str, socket_name: str,
-                        id_to_node: dict) -> tuple[str, str]:
+
+def _split_combined_ref(
+    node_ref: str, socket_name: str, id_to_node: dict
+) -> tuple[str, str]:
     if not node_ref or node_ref in id_to_node:
         return node_ref, socket_name
     for sep in [".", "/", " -> ", "->", " → ", "→", ":"]:
@@ -1627,7 +2350,73 @@ _DEFAULT_OUTPUTS = {
     "GeometryNodeInputPosition": "Position",
     "GeometryNodeInputNormal": "Normal",
     "GeometryNodeInputIndex": "Index",
+    "GeometryNodeInputNamedAttribute": "Value",
+    "GeometryNodeInputSceneTime": "Time",
+    "GeometryNodeInputActiveCamera": "Camera",
+    "GeometryNodeObjectInfo": "Geometry",
+    "GeometryNodeCollectionInfo": "Instances",
+    "GeometryNodeCameraInfo": "View Vector",
+    "GeometryNodeBoolean": "Mesh",
+    "GeometryNodeExtrudeMesh": "Mesh",
+    "GeometryNodeDeleteGeometry": "Geometry",
+    "GeometryNodeSplitToInstances": "Instances",
+    "GeometryNodeSeparateGeometry": "Geometry",
+    "GeometryNodeTriangulate": "Mesh",
+    "GeometryNodeConvexHull": "Geometry",
+    "GeometryNodeBoundingBox": "Bounding Box",
+    "GeometryNodeCurveToMesh": "Mesh",
+    "GeometryNodeCurveToPoints": "Points",
+    "GeometryNodePointsToCurves": "Curves",
+    "GeometryNodeResampleCurve": "Curve",
+    "GeometryNodeSubdivideCurve": "Curve",
+    "GeometryNodeTrimCurve": "Curve",
+    "GeometryNodeFilletCurve": "Curve",
+    "GeometryNodeInterpolateCurves": "Curve",
+    "GeometryNodeOffsetPointInCurve": "Vector",
+    "GeometryNodeSplineParameter": "Position",
+    "GeometryNodeSetCurveRadius": "Curve",
+    "GeometryNodeSetCurveTilt": "Curve",
+    "GeometryNodeSetHandleType": "Curve",
+    "GeometryNodeSetSplineResolution": "Curve",
+    "GeometryNodeReverseCurve": "Curve",
+    "GeometryNodeStoreNamedAttribute": "Geometry",
+    "GeometryNodeCaptureAttribute": "Geometry",
+    "GeometryNodeNamedAttribute": "Value",
+    "GeometryNodeViewer": "Geometry",
+    "GeometryNodeSimulationInput": "Geometry",
+    "GeometryNodeSimulationOutput": "Geometry",
+    "GeometryNodeRepeatInput": "Geometry",
+    "GeometryNodeRepeatOutput": "Geometry",
+    "GeometryNodeForEachElementInput": "Geometry",
+    "GeometryNodeForEachElementOutput": "Geometry",
+    "FunctionNodeTransformPoint": "Point",
+    "FunctionNodeTransformDirection": "Direction",
+    "FunctionNodeInvertMatrix": "Inverse",
+    "FunctionNodeCombineMatrix": "Matrix",
+    "FunctionNodeSeparateMatrix": "Row 1",
+    "FunctionNodeRotateEuler": "Rotation",
+    "FunctionNodeAlignEulerToVector": "Rotation",
+    "FunctionNodeProjectPoint": "Result",
     "FunctionNodeRandomValue": "Value",
+    "FunctionNodeCompare": "Result",
+    "GeometryNodeMergeByDistance": "Geometry",
+    "GeometryNodeDualMesh": "Mesh",
+    "GeometryNodeCurvePrimitiveLine": "Curve",
+    "GeometryNodeCurvePrimitiveCircle": "Curve",
+    "GeometryNodeCurvePrimitiveRectangle": "Curve",
+    "GeometryNodeCurvePrimitiveQuadrilateral": "Curve",
+    "GeometryNodeMeshLine": "Mesh",
+    "GeometryNodeMeshCircle": "Mesh",
+    "GeometryNodeMeshTriangle": "Mesh",
+    "GeometryNodeImageTexture": "Color",
+    "GeometryNodeFieldAtIndex": "Value",
+    "GeometryNodeDomainSize": "Size",
+    "GeometryNodeRemoveAttribute": "Geometry",
+    "GeometryNodeSplineType": "Curve",
+    "GeometryNodeIsViewport": "Is Viewport",
+    "GeometryNodeInstancesToPoints": "Points",
+    "GeometryNodePointsToVertices": "Mesh",
+    "GeometryNodeImageInfo": "Width",
 }
 
 _DEFAULT_INPUTS = {
@@ -1711,8 +2500,10 @@ def _resolve_input(to_node, to_socket_name, from_node=None, from_socket_name="")
 
 # === AUTO-LAYOUT ===
 
-def _auto_layout_from_ids(ids: list[str], id_to_node: dict,
-                          links_spec: list | None = None):
+
+def _auto_layout_from_ids(
+    ids: list[str], id_to_node: dict, links_spec: list | None = None
+):
     """Position nodes left-to-right. If no links provided, simple grid."""
     if not ids:
         return
@@ -1750,7 +2541,7 @@ def _auto_layout_from_ids(ids: list[str], id_to_node: dict,
         # Simple grid: 3 nodes per column
         columns = []
         for i in range(0, len(ids), 3):
-            columns.append(ids[i:i+3])
+            columns.append(ids[i : i + 3])
 
     x_spacing = 300
     y_spacing = 200
@@ -1765,6 +2556,7 @@ def _auto_layout_from_ids(ids: list[str], id_to_node: dict,
 
 
 # === POLL TIMER (multi-phase) ===
+
 
 def _poll_timer() -> float | None:
     """100ms poller: handles display updates and multi-phase generation."""
@@ -1809,7 +2601,9 @@ def _poll_timer() -> float | None:
                 )
                 if desc:
                     _state.raw_response += f"{desc}\n"
-                _state.raw_response += "\n".join(log) + "\n\nStep 2/2: Asking LLM to connect them…\n"
+                _state.raw_response += (
+                    "\n".join(log) + "\n\nStep 2/2: Asking LLM to connect them…\n"
+                )
 
                 # Store context for step 2
                 _state.gen_node_ids = node_ids
@@ -1859,14 +2653,14 @@ def _poll_timer() -> float | None:
 
                 # Re-layout now that we have links
                 links_data = spec.get("links", [])
-                _auto_layout_from_ids(
-                    list(id_to_node.keys()), id_to_node, links_data
-                )
+                _auto_layout_from_ids(list(id_to_node.keys()), id_to_node, links_data)
 
                 # Combine logs
                 prev = _state.raw_response
                 _state.raw_response = (
-                    prev + "\n--- Link Log ---\n" + "\n".join(link_log)
+                    prev
+                    + "\n--- Link Log ---\n"
+                    + "\n".join(link_log)
                     + "\n\nDone! Debug saved to text blocks."
                 )
                 _state.build_log.extend(link_log)
@@ -1892,14 +2686,14 @@ def _poll_timer() -> float | None:
 
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
-                if area.type == 'NODE_EDITOR':
+                if area.type == "NODE_EDITOR":
                     area.tag_redraw()
 
     # Unregister when fully done
     if not _state.is_running and _state.gen_phase == "idle":
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
-                if area.type == 'NODE_EDITOR':
+                if area.type == "NODE_EDITOR":
                     area.tag_redraw()
         return None
 
@@ -1909,9 +2703,9 @@ def _poll_timer() -> float | None:
 def _find_active_tree() -> bpy.types.NodeTree | None:
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
-            if area.type == 'NODE_EDITOR':
+            if area.type == "NODE_EDITOR":
                 for space in area.spaces:
-                    if space.type == 'NODE_EDITOR' and space.edit_tree:
+                    if space.type == "NODE_EDITOR" and space.edit_tree:
                         return space.edit_tree
     return None
 
@@ -1940,14 +2734,14 @@ def _restore_tree_from_snapshot(tree, snapshot: dict) -> list[str]:
             continue
         try:
             node = tree.nodes.new(bl_id)
-            node.name  = nd.get("name", "")
+            node.name = nd.get("name", "")
             node.label = nd.get("label", "")
             loc = nd.get("location", [0.0, 0.0])
             if isinstance(loc, (list, tuple)) and len(loc) >= 2:
                 node.location = (float(loc[0]), float(loc[1]))
             name_to_node[node.name] = node
         except Exception as exc:
-            log.append(f"WARN  Restore node '{nd.get('name','')}' failed: {exc}")
+            log.append(f"WARN  Restore node '{nd.get('name', '')}' failed: {exc}")
 
     for lk in snapshot.get("links", []):
         fn = lk.get("from_node", "")
@@ -1955,11 +2749,11 @@ def _restore_tree_from_snapshot(tree, snapshot: dict) -> list[str]:
         tn = lk.get("to_node", "")
         ts = lk.get("to_socket", "")
         from_node = name_to_node.get(fn)
-        to_node   = name_to_node.get(tn)
+        to_node = name_to_node.get(tn)
         if not from_node or not to_node:
             continue
         from_sock = _find_socket(from_node.outputs, fs)
-        to_sock   = _find_socket(to_node.inputs,   ts)
+        to_sock = _find_socket(to_node.inputs, ts)
         if from_sock and to_sock:
             tree.links.new(from_sock, to_sock)
 
@@ -1969,11 +2763,13 @@ def _restore_tree_from_snapshot(tree, snapshot: dict) -> list[str]:
 
 # === OPERATORS ===
 
+
 class QNA_OT_RefreshModels(bpy.types.Operator):
     """Fetch available models from Ollama, filter embedding models, and auto-select the best ones"""
+
     bl_idname = "qna.refresh_models"
     bl_label = "Refresh Models"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     def execute(self, context):
         base_url = _pref("ollama_base_url", "http://localhost:11434")
@@ -1988,8 +2784,10 @@ class QNA_OT_RefreshModels(bpy.types.Operator):
             filtered = len(all_names) - len(usable)
 
             if not usable:
-                self.report({'WARNING'}, "No usable models found (all were embedding models)")
-                return {'CANCELLED'}
+                self.report(
+                    {"WARNING"}, "No usable models found (all were embedding models)"
+                )
+                return {"CANCELLED"}
 
             _rebuild_model_lists(all_names)
 
@@ -2000,7 +2798,7 @@ class QNA_OT_RefreshModels(bpy.types.Operator):
             best_ana = _best_model_for(usable, "ana")
 
             gen_list = [item[0] for item in _model_items_generate if item[0] != "none"]
-            ana_list = [item[0] for item in _model_items_analyze  if item[0] != "none"]
+            ana_list = [item[0] for item in _model_items_analyze if item[0] != "none"]
 
             if scene.qna_model_generate not in gen_list and best_gen:
                 scene.qna_model_generate = best_gen
@@ -2012,20 +2810,21 @@ class QNA_OT_RefreshModels(bpy.types.Operator):
                 msg += f" ({filtered} embedding model(s) hidden)"
             if best_gen:
                 msg += f" · best generate: {best_gen.split(':')[0]}"
-            self.report({'INFO'}, msg)
+            self.report({"INFO"}, msg)
 
         except urllib.error.URLError:
-            self.report({'ERROR'}, "Could not reach Ollama — is it running?")
+            self.report({"ERROR"}, "Could not reach Ollama — is it running?")
         except Exception as exc:
-            self.report({'ERROR'}, f"Refresh failed: {exc}")
-        return {'FINISHED'}
+            self.report({"ERROR"}, f"Refresh failed: {exc}")
+        return {"FINISHED"}
 
 
 class QNA_OT_Abort(bpy.types.Operator):
     """Stop the current generation or analysis"""
+
     bl_idname = "qna.abort"
     bl_label = "Abort"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
@@ -2033,31 +2832,29 @@ class QNA_OT_Abort(bpy.types.Operator):
 
     def execute(self, context):
         _state.abort_requested = True
-        return {'FINISHED'}
+        return {"FINISHED"}
 
 
 class QNA_OT_Revert(bpy.types.Operator):
     """Restore the node tree to its state before the last generation"""
+
     bl_idname = "qna.revert"
     bl_label = "Undo Last Generation"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
-        return (
-            _state.pre_gen_snapshot is not None
-            and not _state.is_running
-        )
+        return _state.pre_gen_snapshot is not None and not _state.is_running
 
     def execute(self, context):
         if _state.pre_gen_snapshot is None:
-            self.report({'WARNING'}, "No snapshot available.")
-            return {'CANCELLED'}
+            self.report({"WARNING"}, "No snapshot available.")
+            return {"CANCELLED"}
 
         tree = _find_active_tree()
         if tree is None:
-            self.report({'ERROR'}, "No active node tree found.")
-            return {'CANCELLED'}
+            self.report({"ERROR"}, "No active node tree found.")
+            return {"CANCELLED"}
 
         snapshot = _state.pre_gen_snapshot
         _state.pre_gen_snapshot = None  # consume immediately so button hides
@@ -2069,23 +2866,24 @@ class QNA_OT_Revert(bpy.types.Operator):
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
-                if area.type == 'NODE_EDITOR':
+                if area.type == "NODE_EDITOR":
                     area.tag_redraw()
 
-        self.report({'INFO'}, "Node tree reverted to pre-generation state.")
-        return {'FINISHED'}
+        self.report({"INFO"}, "Node tree reverted to pre-generation state.")
+        return {"FINISHED"}
 
 
 class QNA_OT_AskQwen(bpy.types.Operator):
     """Analyze the current node tree"""
+
     bl_idname = "qna.ask_qwen"
     bl_label = "Ask Qwen"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
         space = context.space_data
-        if not space or space.type != 'NODE_EDITOR':
+        if not space or space.type != "NODE_EDITOR":
             return False
         if _state.is_running:
             return False
@@ -2098,7 +2896,7 @@ class QNA_OT_AskQwen(bpy.types.Operator):
             _state.error = "Please enter a question first."
             _state.response_lines = []
             _state.raw_response = ""
-            return {'CANCELLED'}
+            return {"CANCELLED"}
 
         _state.response_lines = []
         _state.raw_response = ""
@@ -2113,39 +2911,47 @@ class QNA_OT_AskQwen(bpy.types.Operator):
         except Exception as exc:
             _state.error = f"Serialization failed: {exc}"
             _state.is_running = False
-            return {'CANCELLED'}
+            return {"CANCELLED"}
 
         base_url = _pref("ollama_base_url", "http://localhost:11434")
-        model = context.scene.qna_model_analyze or _pref("ollama_model_analyze", "qwen2.5vl:7b")
+        model = context.scene.qna_model_analyze or _pref(
+            "ollama_model_analyze", "qwen2.5vl:7b"
+        )
         _state.loaded_base_url = base_url
         _state.loaded_model = model
         _state.model_is_loaded = True
         messages = [
             {"role": "system", "content": _ANALYZE_SYSTEM},
-            {"role": "user", "content": (
-                f"Node tree JSON:\n```json\n{tree_json}\n```\n\nQuestion: {question}"
-            )},
+            {
+                "role": "user",
+                "content": (
+                    f"Node tree JSON:\n```json\n{tree_json}\n```\n\nQuestion: {question}"
+                ),
+            },
         ]
 
         thread = threading.Thread(
-            target=_bg_analyze, args=(base_url, model, messages), daemon=True,
+            target=_bg_analyze,
+            args=(base_url, model, messages),
+            daemon=True,
         )
         thread.start()
         if not bpy.app.timers.is_registered(_poll_timer):
             bpy.app.timers.register(_poll_timer, first_interval=0.1)
-        return {'FINISHED'}
+        return {"FINISHED"}
 
 
 class QNA_OT_GenerateNodes(bpy.types.Operator):
     """Generate nodes using 2-step constrained pipeline"""
+
     bl_idname = "qna.generate_nodes"
     bl_label = "Generate Nodes"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
         space = context.space_data
-        if not space or space.type != 'NODE_EDITOR':
+        if not space or space.type != "NODE_EDITOR":
             return False
         if _state.is_running:
             return False
@@ -2158,7 +2964,7 @@ class QNA_OT_GenerateNodes(bpy.types.Operator):
             _state.error = "Please describe the node setup you want."
             _state.response_lines = []
             _state.raw_response = ""
-            return {'CANCELLED'}
+            return {"CANCELLED"}
 
         # Reset all state
         _state.response_lines = []
@@ -2181,7 +2987,9 @@ class QNA_OT_GenerateNodes(bpy.types.Operator):
         # Store context for multi-phase pipeline
         _state.gen_user_prompt = prompt
         _state.gen_base_url = _pref("ollama_base_url", "http://localhost:11434")
-        _state.gen_model = context.scene.qna_model_generate or _pref("ollama_model_generate", "qwen2.5-coder:14b")
+        _state.gen_model = context.scene.qna_model_generate or _pref(
+            "ollama_model_generate", "qwen2.5-coder:14b"
+        )
         _state.gen_tree_type = tree.bl_idname
         _state.loaded_base_url = _state.gen_base_url
         _state.loaded_model = _state.gen_model
@@ -2219,14 +3027,15 @@ class QNA_OT_GenerateNodes(bpy.types.Operator):
         thread.start()
         if not bpy.app.timers.is_registered(_poll_timer):
             bpy.app.timers.register(_poll_timer, first_interval=0.2)
-        return {'FINISHED'}
+        return {"FINISHED"}
 
 
 class QNA_OT_CopyResponse(bpy.types.Operator):
     """Copy response to clipboard"""
+
     bl_idname = "qna.copy_response"
     bl_label = "Copy Response"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
@@ -2234,21 +3043,21 @@ class QNA_OT_CopyResponse(bpy.types.Operator):
 
     def execute(self, context):
         context.window_manager.clipboard = _state.raw_response
-        self.report({'INFO'}, "Copied.")
-        return {'FINISHED'}
+        self.report({"INFO"}, "Copied.")
+        return {"FINISHED"}
 
 
 class QNA_OT_ExportTree(bpy.types.Operator):
     """Export node tree JSON to text block"""
+
     bl_idname = "qna.export_tree_json"
     bl_label = "Export Tree JSON"
-    bl_options = {'REGISTER'}
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
         space = context.space_data
-        return (space and space.type == 'NODE_EDITOR'
-                and space.edit_tree is not None)
+        return space and space.type == "NODE_EDITOR" and space.edit_tree is not None
 
     def execute(self, context):
         tree = context.space_data.edit_tree
@@ -2256,17 +3065,18 @@ class QNA_OT_ExportTree(bpy.types.Operator):
             data = serialize_node_tree(tree)
             name = f"NodeTree_{tree.name}.json"
             _save_debug_text(name, json.dumps(data, indent=2))
-            self.report({'INFO'}, f"Exported to '{name}'")
+            self.report({"INFO"}, f"Exported to '{name}'")
         except Exception as exc:
-            self.report({'ERROR'}, str(exc))
-        return {'FINISHED'}
+            self.report({"ERROR"}, str(exc))
+        return {"FINISHED"}
 
 
 # === PANELS ===
 
+
 class _QNA_PT_Base:
-    bl_space_type = 'NODE_EDITOR'
-    bl_region_type = 'UI'
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
     bl_category = "Qwen Assistant"
 
     def draw(self, context):
@@ -2278,14 +3088,14 @@ class _QNA_PT_Base:
 
         if tree:
             header = layout.row()
-            header.label(text=f"Tree: {tree.name}", icon='NODETREE')
+            header.label(text=f"Tree: {tree.name}", icon="NODETREE")
             sub = layout.row()
             sub.label(
                 text=f"{len(tree.nodes)} nodes · {len(tree.links)} links",
-                icon='INFO',
+                icon="INFO",
             )
         else:
-            layout.label(text="No active node tree.", icon='ERROR')
+            layout.label(text="No active node tree.", icon="ERROR")
             return
 
         layout.separator()
@@ -2299,33 +3109,33 @@ class _QNA_PT_Base:
 
         # --- Model selector ---
         model_row = layout.row(align=True)
-        if mode == 'ANALYZE':
+        if mode == "ANALYZE":
             model_row.prop(scene, "qna_model_analyze", text="Model")
             selected_model = scene.qna_model_analyze
         else:
             model_row.prop(scene, "qna_model_generate", text="Model")
             selected_model = scene.qna_model_generate
-        model_row.operator("qna.refresh_models", text="", icon='FILE_REFRESH')
+        model_row.operator("qna.refresh_models", text="", icon="FILE_REFRESH")
 
         # --- Model description ---
         profile = _get_model_profile(selected_model)
         if profile:
             box = layout.box()
             box.scale_y = 0.75
-            box.label(text=f"+ {profile['pros']}", icon='CHECKMARK')
-            box.label(text=f"- {profile['cons']}", icon='X')
+            box.label(text=f"+ {profile['pros']}", icon="CHECKMARK")
+            box.label(text=f"- {profile['cons']}", icon="X")
         elif selected_model and selected_model != "none":
             box = layout.box()
             box.scale_y = 0.75
-            box.label(text="Unknown model — no profile available", icon='QUESTION')
+            box.label(text="Unknown model — no profile available", icon="QUESTION")
 
         # --- Generate-only options ---
-        if mode == 'GENERATE':
+        if mode == "GENERATE":
             layout.prop(scene, "qna_clear_before_gen")
 
         layout.separator()
 
-        if mode == 'ANALYZE':
+        if mode == "ANALYZE":
             layout.label(text="Your question:")
         else:
             layout.label(text="Describe the node setup you want:")
@@ -2349,30 +3159,34 @@ class _QNA_PT_Base:
             else:
                 label = "Working…"
             main_btn.operator(
-                "qna.ask_qwen" if mode == 'ANALYZE' else "qna.generate_nodes",
-                text=label, icon='SORTTIME',
+                "qna.ask_qwen" if mode == "ANALYZE" else "qna.generate_nodes",
+                text=label,
+                icon="SORTTIME",
             )
-        elif mode == 'ANALYZE':
-            main_btn.operator("qna.ask_qwen", text="Ask Qwen", icon='VIEWZOOM')
+        elif mode == "ANALYZE":
+            main_btn.operator("qna.ask_qwen", text="Ask Qwen", icon="VIEWZOOM")
         else:
             main_btn.operator(
                 "qna.generate_nodes",
-                text="Generate Nodes", icon='NODETREE',
+                text="Generate Nodes",
+                icon="NODETREE",
             )
 
-        row.operator("qna.export_tree_json", text="", icon='FILE_TEXT')
-        row.operator("qna.copy_response", text="", icon='COPYDOWN')
+        row.operator("qna.export_tree_json", text="", icon="FILE_TEXT")
+        row.operator("qna.copy_response", text="", icon="COPYDOWN")
 
         if _state.is_running:
             abort_row = layout.row()
             abort_row.alert = True
             abort_row.scale_y = 1.2
-            abort_row.operator("qna.abort", text="Abort", icon='X')
+            abort_row.operator("qna.abort", text="Abort", icon="X")
 
         if _state.pre_gen_snapshot is not None and not _state.is_running:
             revert_row = layout.row()
             revert_row.scale_y = 1.1
-            revert_row.operator("qna.revert", text="Undo Last Generation", icon='LOOP_BACK')
+            revert_row.operator(
+                "qna.revert", text="Undo Last Generation", icon="LOOP_BACK"
+            )
 
         layout.separator()
 
@@ -2381,18 +3195,18 @@ class _QNA_PT_Base:
             box.alert = True
             wrap_w = _pref("response_wrap_width", 62)
             for line in textwrap.wrap(_state.error, width=wrap_w):
-                box.label(text=line, icon='ERROR')
+                box.label(text=line, icon="ERROR")
             return
 
         if _state.response_lines or _state.is_running:
             box = layout.box()
             if _state.is_running and not _state.response_lines:
-                box.label(text="Waiting for response…", icon='SORTTIME')
+                box.label(text="Waiting for response…", icon="SORTTIME")
             else:
                 for line in _state.response_lines:
                     box.label(text=line if line else " ")
             if _state.is_running:
-                box.label(text="▍ working…", icon='SORTTIME')
+                box.label(text="▍ working…", icon="SORTTIME")
 
 
 class QNA_PT_ShaderPanel(_QNA_PT_Base, bpy.types.Panel):
@@ -2402,7 +3216,7 @@ class QNA_PT_ShaderPanel(_QNA_PT_Base, bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         s = context.space_data
-        return s and s.type == 'NODE_EDITOR' and s.tree_type == 'ShaderNodeTree'
+        return s and s.type == "NODE_EDITOR" and s.tree_type == "ShaderNodeTree"
 
 
 class QNA_PT_GeometryPanel(_QNA_PT_Base, bpy.types.Panel):
@@ -2412,7 +3226,7 @@ class QNA_PT_GeometryPanel(_QNA_PT_Base, bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         s = context.space_data
-        return s and s.type == 'NODE_EDITOR' and s.tree_type == 'GeometryNodeTree'
+        return s and s.type == "NODE_EDITOR" and s.tree_type == "GeometryNodeTree"
 
 
 class QNA_PT_CompositorPanel(_QNA_PT_Base, bpy.types.Panel):
@@ -2422,7 +3236,7 @@ class QNA_PT_CompositorPanel(_QNA_PT_Base, bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         s = context.space_data
-        return s and s.type == 'NODE_EDITOR' and s.tree_type == 'CompositorNodeTree'
+        return s and s.type == "NODE_EDITOR" and s.tree_type == "CompositorNodeTree"
 
 
 # === REGISTRATION ===
@@ -2448,7 +3262,8 @@ def _unload_model_bg(base_url: str, model: str):
         url = f"{base_url.rstrip('/')}/api/generate"
         payload = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
         req = urllib.request.Request(
-            url, data=payload,
+            url,
+            data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -2515,10 +3330,22 @@ def register():
     bpy.types.Scene.qna_mode = bpy.props.EnumProperty(
         name="Mode",
         items=[
-            ('ANALYZE', "Analyze", "Ask questions about the current node tree", 'VIEWZOOM', 0),
-            ('GENERATE', "Generate", "Create nodes from a text description", 'NODETREE', 1),
+            (
+                "ANALYZE",
+                "Analyze",
+                "Ask questions about the current node tree",
+                "VIEWZOOM",
+                0,
+            ),
+            (
+                "GENERATE",
+                "Generate",
+                "Create nodes from a text description",
+                "NODETREE",
+                1,
+            ),
         ],
-        default='ANALYZE',
+        default="ANALYZE",
         update=_on_mode_change,
     )
     bpy.types.Scene.qna_model_generate = bpy.props.EnumProperty(
@@ -2543,8 +3370,13 @@ def unregister():
         bpy.app.timers.unregister(_poll_timer)
     if bpy.app.timers.is_registered(_panel_watch_timer):
         bpy.app.timers.unregister(_panel_watch_timer)
-    for attr in ("qna_user_question", "qna_mode",
-                 "qna_model_generate", "qna_model_analyze", "qna_clear_before_gen"):
+    for attr in (
+        "qna_user_question",
+        "qna_mode",
+        "qna_model_generate",
+        "qna_model_analyze",
+        "qna_clear_before_gen",
+    ):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
     for cls in reversed(_classes):
