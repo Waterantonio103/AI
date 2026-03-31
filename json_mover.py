@@ -84,19 +84,60 @@ def deserialize_val(val):
         elif id_type == 'Image' and name in bpy.data.images: return bpy.data.images[name]
         elif id_type == 'Collection' and name in bpy.data.collections: return bpy.data.collections[name]
         elif id_type == 'Texture' and name in bpy.data.textures: return bpy.data.textures[name]
-        elif id_type == 'NodeTree' and name in bpy.data.node_groups: return bpy.data.node_groups[name]
+        # NodeTree subclasses (GeometryNodeTree, ShaderNodeTree, CompositorNodeTree, etc.)
+        # are serialised with their concrete type name, not the base class name 'NodeTree'.
+        # Matching on 'NodeTree' in the name covers all of them.
+        elif 'NodeTree' in (id_type or '') and name in bpy.data.node_groups:
+            return bpy.data.node_groups[name]
         return None
     return val
 
-def extract_node_tree(node_tree, tree_type):
+def extract_node_tree(node_tree, tree_type, _shared_groups=None):
+    """Recursively serialise *node_tree* and all sub-node-groups it references.
+
+    *_shared_groups* is a flat dict ``{group_name: data}`` that is created once
+    at the root call and shared across every recursive call so each sub-group is
+    only exported once and circular references are avoided.
+    """
+    is_root = _shared_groups is None
+    if is_root:
+        _shared_groups = {}
+
     data = {
         "tree_type": tree_type,
         "nodes": [],
-        "links": []
+        "links": [],
+        "interface": []
     }
-    
+
+    # Extract interface (Group Inputs/Outputs)
+    if hasattr(node_tree, "interface"):
+        for item in getattr(node_tree.interface, "items_tree", []):
+            if getattr(item, "item_type", "SOCKET") == "SOCKET":
+                data["interface"].append({
+                    "name": item.name,
+                    "in_out": item.in_out,
+                    "socket_type": item.socket_type,
+                    "identifier": getattr(item, "identifier", "")
+                })
+
     for node in node_tree.nodes:
         props = {}
+        if hasattr(node, "node_tree") and node.node_tree:
+            sub_ng = node.node_tree
+            s_val = serialize_val(sub_ng)
+            if s_val is not None:
+                props["node_tree"] = s_val
+            # Recursively embed the sub-group so the target file can recreate it
+            # even if it doesn't have it. Use _shared_groups as a visited set to
+            # avoid infinite loops with self-referencing groups.
+            if sub_ng.name not in _shared_groups:
+                _shared_groups[sub_ng.name] = {}  # placeholder prevents re-entry
+                sub_type = type(sub_ng).__name__  # e.g. 'GeometryNodeTree'
+                _shared_groups[sub_ng.name] = extract_node_tree(
+                    sub_ng, sub_type, _shared_groups
+                )
+                
         # Make sure to handle all custom properties without getting blocked by base properties
         for key in node.bl_rna.properties.keys():
             if key in ('name', 'type', 'location', 'dimensions', 'width', 'height', 'color', 'use_custom_color', 
@@ -138,7 +179,7 @@ def extract_node_tree(node_tree, tree_type):
                         }
             except: pass
 
-        data["nodes"].append({
+        n_data = {
             "name": node.name,
             "bl_idname": node.bl_idname,
             "location": list(node.location),
@@ -147,21 +188,157 @@ def extract_node_tree(node_tree, tree_type):
             "properties": props,
             "inputs": inputs_data,
             "outputs": outputs_data
-        })
+        }
+
+        # dynamic node items (Capture Attribute, Store Named Attribute, Repeat Zones)
+        items_collections = ['capture_items', 'store_items', 'repeat_items', 'simulation_items']
+        node_items = {}
+        for col_name in items_collections:
+            if hasattr(node, col_name):
+                col = getattr(node, col_name)
+                extracted_col = []
+                for item in col:
+                    item_data = {}
+                    for k in item.bl_rna.properties.keys():
+                        if k not in ('rna_type', 'name'):
+                            try:
+                                v = getattr(item, k)
+                                sv = serialize_val(v)
+                                if sv is not None:
+                                    item_data[k] = sv
+                            except: pass
+                    extracted_col.append(item_data)
+                if extracted_col:
+                    node_items[col_name] = extracted_col
+        if node_items:
+            n_data["node_items"] = node_items
+
+        data["nodes"].append(n_data)
         
     for link in node_tree.links:
+        try:
+            from_idx = list(link.from_node.outputs).index(link.from_socket)
+        except ValueError:
+            from_idx = None
+        try:
+            to_idx = list(link.to_node.inputs).index(link.to_socket)
+        except ValueError:
+            to_idx = None
         data["links"].append({
             "from_node": link.from_node.name,
             "from_socket": link.from_socket.identifier,
+            "from_socket_name": link.from_socket.name,
+            "from_socket_index": from_idx,
             "to_node": link.to_node.name,
-            "to_socket": link.to_socket.identifier
+            "to_socket": link.to_socket.identifier,
+            "to_socket_name": link.to_socket.name,
+            "to_socket_index": to_idx,
         })
-        
+
+    if is_root:
+        data["embedded_groups"] = _shared_groups
+
     return data
 
+# Group Input/Output nodes have sockets that are dynamically mirrored from
+# node_tree.interface. When interface sockets are recreated, Blender assigns
+# brand-new identifiers, so the old identifiers stored in the JSON will no
+# longer match. We resolve sockets with a priority chain:
+#   1. Translated identifier via interface_id_map  (most reliable)
+#   2. Unique name match                           (safe only when names are unique)
+#   3. Positional index                            (definitive tie-breaker)
+def _resolve_socket(collection, old_id, name, index, interface_id_map):
+    """Return the best-matching socket from *collection*.
+
+    Works correctly for both standard nodes and group boundary nodes
+    (NodeGroupInput / NodeGroupOutput) whose identifiers change on every
+    interface rebuild.
+    """
+    # 1. Try the mapped/translated identifier first
+    mapped_id = interface_id_map.get(old_id, old_id)
+    sock = collection.get(mapped_id)
+    if sock:
+        return sock
+
+    # 2. Direct identifier lookup (in case map wasn't needed)
+    if mapped_id != old_id:
+        sock = collection.get(old_id)
+        if sock:
+            return sock
+
+    # 3. Scan for identifier or unique name match
+    name_matches = []
+    for s in collection:
+        if s.identifier == mapped_id or s.identifier == old_id:
+            return s  # exact identifier hit
+        if s.name == name:
+            name_matches.append(s)
+
+    if len(name_matches) == 1:
+        return name_matches[0]  # unambiguous name match
+
+    # 4. Positional index — definitive tie-breaker for duplicate names
+    if index is not None and index < len(collection):
+        return collection[index]
+
+    # 5. Last resort: first name match even if ambiguous
+    if name_matches:
+        return name_matches[0]
+
+    return None
+
+
+def _ensure_embedded_groups(embedded):
+    """Recreate sub-node-groups embedded in an exported JSON.
+
+    Two-pass strategy:
+      Pass 1 — Create EMPTY SHELLS for groups that don't exist yet, so every
+               cross-reference can be resolved in Pass 2.  Groups that already
+               exist in the target file are left completely untouched — their
+               nodes, links, and interface stay exactly as-is so the outer
+               GeometryNodeGroup node can bind to them without corruption.
+      Pass 2 — Build the contents of only the newly-created shells.
+
+    This prevents the .001 / .002 duplicate explosion that happens when we
+    clear-and-rebuild groups the target file already has correctly set up.
+    """
+    # Pass 1: create shells that don't yet exist; record which ones we made
+    to_build = []
+    for group_name, group_data in embedded.items():
+        if not group_data:          # skip empty placeholder entries
+            continue
+        if group_name not in bpy.data.node_groups:
+            group_type = group_data.get("tree_type", "GeometryNodeTree")
+            bpy.data.node_groups.new(name=group_name, type=group_type)
+            to_build.append(group_name)
+        # If it already exists → leave it alone; the node will bind to it
+
+    # Pass 2: build only the shells we just created (all other shells exist)
+    for group_name in to_build:
+        ng = bpy.data.node_groups[group_name]
+        build_node_tree(ng, embedded[group_name])
+
+
 def build_node_tree(node_tree, data):
-    node_tree.nodes.clear() # clear default nodes
+    node_tree.nodes.clear()  # clear default nodes
     created_nodes = {}
+
+    # -1. Ensure any embedded sub-groups exist before we try to assign node.node_tree
+    embedded = data.get("embedded_groups", {})
+    if embedded:
+        _ensure_embedded_groups(embedded)
+
+    # 0. Recreate interface (needed for Group Input/Output nodes)
+    interface_id_map = {}
+    if hasattr(node_tree, "interface") and "interface" in data:
+        node_tree.interface.clear()
+        for idata in data["interface"]:
+            try:
+                new_sock = node_tree.interface.new_socket(name=idata["name"], in_out=idata["in_out"], socket_type=idata["socket_type"])
+                if "identifier" in idata and idata["identifier"]:
+                    interface_id_map[idata["identifier"]] = new_sock.identifier
+            except Exception as e:
+                print(f"Error creating interface socket {idata.get('name')}: {e}")
     
     # 1. Create nodes
     for n_data in data.get("nodes", []):
@@ -175,7 +352,29 @@ def build_node_tree(node_tree, data):
         node.location = n_data.get("location", (0,0))
         node.width = n_data.get("width", 140.0)
         
-        # properties
+        # default socket values
+        # dynamic interface items (Capture Attribute, Store Named Attribute, etc)
+        # MUST do this before sockets are resolved so that dynamic sockets appear!
+        for col_name, extracted_col in n_data.get("node_items", {}).items():
+            if hasattr(node, col_name):
+                col = getattr(node, col_name)
+                col.clear() # reset default items
+                for item_data in extracted_col:
+                    # new() usually requires minimal args; name or type
+                    # We try to use data_type and domain from the extracted data
+                    dt = item_data.get('data_type', 'FLOAT')
+                    name = item_data.get('name', '')
+                    try:
+                        new_item = col.new(dt, name)
+                        for k, v in item_data.items():
+                            if hasattr(new_item, k):
+                                d_v = deserialize_val(v)
+                                if d_v is not None:
+                                    try: setattr(new_item, k, d_v)
+                                    except: pass
+                    except Exception as e:
+                        print(f"Failed to create item in {col_name}: {e}")
+
         for k, v in n_data.get("properties", {}).items():
             if hasattr(node, k):
                 try:
@@ -210,34 +409,66 @@ def build_node_tree(node_tree, data):
                 
         created_nodes[node.name] = node
         
+    # 2a. Second-pass: retry node_tree assignment for GeometryNodeGroup nodes
+    #     whose node_tree was None after Pass 1 (can happen if the group was
+    #     created AFTER this node was processed in the node loop above, e.g.
+    #     because embedded_groups weren't available for a nested sub-tree).
+    for n_data in data.get("nodes", []):
+        if n_data.get("bl_idname") != "GeometryNodeGroup":
+            continue
+        node = created_nodes.get(n_data["name"])
+        if node is None or node.node_tree is not None:
+            continue  # already resolved
+        nt_ref = n_data.get("properties", {}).get("node_tree")
+        if nt_ref:
+            resolved = deserialize_val(nt_ref)
+            if resolved is not None:
+                try:
+                    node.node_tree = resolved
+                    print(f"[json_mover] Second-pass resolved node_tree "
+                          f"'{resolved.name}' for '{node.name}'")
+                except Exception as e:
+                    print(f"[json_mover] Second-pass failed for '{node.name}': {e}")
+
     # 2. Links
     for l_data in data.get("links", []):
         from_node = created_nodes.get(l_data["from_node"])
         to_node = created_nodes.get(l_data["to_node"])
-        if from_node and to_node:
-            from_sock_id = l_data["from_socket"]
-            to_sock_id = l_data["to_socket"]
-            
-            f_sock = from_node.outputs.get(from_sock_id)
-            if not f_sock:
-                for sock in from_node.outputs:
-                    if sock.identifier == from_sock_id:
-                        f_sock = sock
-                        break
+        if not (from_node and to_node):
+            continue
 
-            t_sock = to_node.inputs.get(to_sock_id)
-            if not t_sock:
-                for sock in to_node.inputs:
-                    if sock.identifier == to_sock_id:
-                        t_sock = sock
-                        break
-                        
-            # fallback to names if identifier not matched exactly
-            if not f_sock and from_sock_id in from_node.outputs.keys(): f_sock = from_node.outputs[from_sock_id]
-            if not t_sock and to_sock_id in to_node.inputs.keys(): t_sock = to_node.inputs[to_sock_id]
-                
-            if f_sock and t_sock:
+        f_sock = _resolve_socket(
+            from_node.outputs,
+            l_data["from_socket"],
+            l_data.get("from_socket_name", ""),
+            l_data.get("from_socket_index"),
+            interface_id_map,
+        )
+        t_sock = _resolve_socket(
+            to_node.inputs,
+            l_data["to_socket"],
+            l_data.get("to_socket_name", ""),
+            l_data.get("to_socket_index"),
+            interface_id_map,
+        )
+
+        if f_sock and t_sock:
+            try:
                 node_tree.links.new(f_sock, t_sock)
+            except Exception as e:
+                print(f"Failed to link {from_node.name}:{f_sock.name} "
+                      f"→ {to_node.name}:{t_sock.name}: {e}")
+        else:
+            missing = []
+            if not f_sock:
+                missing.append(f"output '{l_data.get('from_socket_name')}' "
+                               f"on {l_data['from_node']}")
+            if not t_sock:
+                missing.append(f"input '{l_data.get('to_socket_name')}' "
+                               f"on {l_data['to_node']}")
+            print(f"Could not resolve socket(s): {', '.join(missing)}")
+
+    return interface_id_map
 
 
 class NODE_OT_export_json_mover(Operator, ExportHelper):
@@ -251,6 +482,30 @@ class NODE_OT_export_json_mover(Operator, ExportHelper):
         options={'HIDDEN'},
         maxlen=255,
     )
+    
+    def invoke(self, context, event):
+        sc_props = context.scene.json_mover_props
+        fname = sc_props.export_filename.strip()
+        
+        if not fname:
+            tree_sel = sc_props.selected_tree
+            if tree_sel != "NONE":
+                fname = tree_sel.split("|", 1)[1]
+            else:
+                fname = "node_tree"
+                
+        if not fname.endswith(".json"):
+            fname += ".json"
+            
+        export_path = sc_props.default_export_path.strip()
+        if export_path:
+            import os
+            dir_path = bpy.path.abspath(export_path)
+            self.filepath = os.path.join(dir_path, fname)
+        else:
+            self.filepath = fname
+            
+        return super().invoke(context, event)
     
     def execute(self, context):
         sc_props = context.scene.json_mover_props
@@ -329,8 +584,52 @@ class NODE_OT_import_json_mover(Operator, ImportHelper):
             self.report({'ERROR'}, "Unknown or missing tree_type in JSON")
             return {'CANCELLED'}
             
-        build_node_tree(node_tree, data)
+        interface_id_map = build_node_tree(node_tree, data)
         self.report({'INFO'}, f"Imported node tree {file_name} as {tree_type}")
+        
+        target_obj = context.scene.json_mover_props.import_target_object
+        if target_obj:
+            bpy.ops.object.select_all(action='DESELECT')
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+            
+            if tree_type == 'SHADER':
+                if hasattr(target_obj, "data") and hasattr(target_obj.data, "materials"):
+                    if not target_obj.data.materials:
+                        target_obj.data.materials.append(mat)
+                    else:
+                        target_obj.data.materials[target_obj.active_material_index] = mat
+            elif tree_type == 'GEOMETRY':
+                has_geomod = False
+                for mod in target_obj.modifiers:
+                    if mod.type == 'NODES':
+                        # Preserve modifier input bindings using the identifier map
+                        old_inputs = {}
+                        for k in mod.keys():
+                            if k not in ('_RNA_UI',):
+                                old_inputs[k] = mod[k]
+                                
+                        mod.node_group = ng
+                        has_geomod = True
+                        
+                        # Reapply inputs to the new identifiers
+                        for old_id, val in old_inputs.items():
+                            base_id = old_id
+                            suffix = ""
+                            if old_id.endswith("_use_attribute"):
+                                base_id = old_id[:-14]
+                                suffix = "_use_attribute"
+                            elif old_id.endswith("_attribute_name"):
+                                base_id = old_id[:-15]
+                                suffix = "_attribute_name"
+                                
+                            new_base = interface_id_map.get(base_id, base_id)
+                            new_key = new_base + suffix
+                            mod[new_key] = val
+                        break
+                if not has_geomod:
+                    gn_mod = target_obj.modifiers.new(name="GeometryNodes", type='NODES')
+                    gn_mod.node_group = ng
         
         # Switch Area to Node Editor
         area = context.area
@@ -347,6 +646,7 @@ class NODE_OT_import_json_mover(Operator, ImportHelper):
         if area.type == 'NODE_EDITOR':
             space = area.spaces.active
             space.tree_type = space_tree_type
+            space.pin = True # Pin the material to easily view it!
             if tree_type == 'GEOMETRY':
                 space.node_tree = node_tree
             elif tree_type == 'SHADER':
@@ -368,12 +668,15 @@ class VIEW3D_PT_json_mover(Panel):
         col = layout.column(align=True)
         col.label(text="Export JSON:")
         col.prop(sc_props, "selected_tree", text="")
+        col.prop(sc_props, "export_filename", text="Export As")
+        col.prop(sc_props, "default_export_path", text="Path")
         col.operator(NODE_OT_export_json_mover.bl_idname, text="Export Selected", icon='EXPORT')
         
         layout.separator()
         
         col = layout.column(align=True)
         col.label(text="Import JSON:")
+        col.prop(sc_props, "import_target_object", text="Apply To")
         col.operator(NODE_OT_import_json_mover.bl_idname, text="Import to Window", icon='IMPORT')
 
 
@@ -382,6 +685,22 @@ class JSONMoverProps(PropertyGroup):
         name="Node Tree",
         description="Select a Node Tree to Export",
         items=get_node_trees
+    )
+    export_filename: StringProperty(
+        name="Export As",
+        description="Name of the file to save as (leave blank to use the node tree's name)",
+        default=""
+    )
+    default_export_path: StringProperty(
+        name="Export Path",
+        description="Default folder to save the JSON file",
+        subtype='DIR_PATH',
+        default=""
+    )
+    import_target_object: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Apply To",
+        description="Object to apply the imported node tree to (optional)"
     )
 
 
